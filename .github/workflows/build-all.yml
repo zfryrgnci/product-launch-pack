@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        game: [spacebala, neonsnake, quantumascent]
+        game: [spacebala, neonsnake, quantumascent, neonblocks]
     runs-on: ubuntu-latest
     defaults:
       run:
