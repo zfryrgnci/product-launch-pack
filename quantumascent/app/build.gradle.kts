@@ -15,8 +15,8 @@ android {
         applicationId = "com.refaz.quantumascent"
         minSdk = 24
         targetSdk = 36
-        versionCode = 4
-        versionName = "1.0"
+        versionCode = 5
+        versionName = "1.1"
         manifestPlaceholders["admobAppId"] = "ca-app-pub-8054232338509216~7187008801"
     }
     signingConfigs {

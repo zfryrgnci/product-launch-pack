@@ -23,7 +23,7 @@ android {
         applicationId = "com.refaz.neonblocks"
         minSdk = 24
         targetSdk = 36
-        versionCode = 13
+        versionCode = 14
         versionName = "1.0"
 
         // AdMob App ID (test id by default — replace with your real one for release).
