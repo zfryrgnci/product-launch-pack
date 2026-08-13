@@ -23,11 +23,11 @@ android {
         applicationId = "com.refaz.neonunravel"
         minSdk = 24
         targetSdk = 36
-        versionCode = 2
+        versionCode = 3
         versionName = "1.0"
 
         // AdMob App ID (test id by default — replace with your real one for release).
-        manifestPlaceholders["admobAppId"] = "ca-app-pub-8054232338509216~9217561765"
+        manifestPlaceholders["admobAppId"] = "ca-app-pub-8054232338509216~8937234431"
     }
 
     signingConfigs {
