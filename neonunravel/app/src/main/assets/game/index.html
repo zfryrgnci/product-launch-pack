@@ -1,0 +1,3971 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#dfe6f0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Neon Unravel</title>
+<style>
+  /*
+   * STRUCTURAL RULE: nothing is ever positioned above #nu-canvas.
+   * Every menu, HUD element, button and results screen is painted onto the
+   * canvas itself. There is no overlay layer that could silently swallow
+   * touch input.
+   */
+  html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    background: #eef3fa;
+    background-image: linear-gradient(to bottom, #eef3fa 0%, #dfe6f0 55%, #cbd6e6 100%);
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  #nu-app {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    background: transparent;
+  }
+  /* Reserves vertical space for a NATIVE banner drawn by the Android wrapper.
+     It is a flex sibling stacked above the canvas - never on top of it. */
+  #nu-banner-slot {
+    flex: 0 0 auto;
+    height: 50px;
+    width: 100%;
+    padding-top: env(safe-area-inset-top);
+    box-sizing: content-box;
+    background: #c3cfe1;
+    display: none;
+  }
+  #nu-canvas-wrap {
+    flex: 1 1 auto;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 0;
+    padding:
+      max(6px, env(safe-area-inset-top))
+      max(6px, env(safe-area-inset-right))
+      max(10px, env(safe-area-inset-bottom))
+      max(6px, env(safe-area-inset-left));
+    box-sizing: border-box;
+  }
+  /* No border-radius: rounded corners would make the corner pixels of the
+     canvas box fall through to the wrapper, so touches there would not reach
+     the game. The canvas paints its own rounded look instead. */
+  #nu-canvas {
+    display: block;
+    touch-action: none;
+    background: #dfe6f0;
+  }
+</style>
+</head>
+<body>
+  <div id="nu-app">
+    <div id="nu-banner-slot"></div>
+    <div id="nu-canvas-wrap">
+      <canvas id="nu-canvas" width="400" height="640"></canvas>
+    </div>
+  </div>
+  <script>
+/*
+ * Neon Unravel - core.js
+ *
+ * Pure engine. No DOM, no canvas, no audio, no timers. Node-requireable.
+ *
+ * THE MECHANIC (snake-follow extraction) - CONFIRMED CORRECT, UNCHANGED:
+ *   Each creature is a contiguous chain of grid cells. cells[0] is the HEAD.
+ *   The player drags the HEAD into an orthogonally adjacent EMPTY cell; every
+ *   body segment then advances into the cell the segment ahead of it just
+ *   vacated (exactly like the game Snake). Length is invariant.
+ *   There are NO pre-defined paths or channels.
+ *   When the head steps into a HOLE of its own colour, the creature "feeds"
+ *   into it one segment at a time until it is gone from the board.
+ *   Feed identity: a feed step is exactly `cells.pop()`.
+ *
+ * OBSTACLES:
+ *   ROCK  - permanently impassable cell.
+ *   CRATE - permanently impassable coloured block (pure space denial).
+ *   GATE  - cell only a colour-matching creature may pass through.
+ *   ICE   - encases a whole creature with a countdown N. The creature cannot be
+ *           dragged at all until N other creatures have exited; every exit
+ *           decrements every other creature's counter.
+ *
+ * DIFFICULTY:
+ *   analyzeLevel() measures branching factor, free-space ratio, maneuver depth
+ *   (repositioning moves genuinely required), solution length and order
+ *   rigidity, and combines them into a 0-100 score. generateLevel() generates
+ *   candidates in a loop and REJECTS any whose score falls outside the target
+ *   band for that level number.
+ */
+;(function (root, factory) {
+  'use strict';
+  var api = factory();
+  if (typeof module === 'object' && module.exports) { module.exports = api; }
+  if (typeof window !== 'undefined') { window.NeonUnravelCore = api; }
+  else if (root) { root.NeonUnravelCore = api; }
+})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  'use strict';
+
+  var VERSION = '3.0.0';
+
+  // ---------------------------------------------------------------- constants
+
+  // Direction indices are stable: 0=up 1=right 2=down 3=left
+  var DIRS = [
+    { name: 'up',    dc: 0,  dr: -1 },
+    { name: 'right', dc: 1,  dr: 0  },
+    { name: 'down',  dc: 0,  dr: 1  },
+    { name: 'left',  dc: -1, dr: 0  }
+  ];
+  var DIR_UP = 0, DIR_RIGHT = 1, DIR_DOWN = 2, DIR_LEFT = 3;
+  var OPPOSITE = [2, 3, 0, 1];
+
+  var COLOR_COUNT = 10;
+
+  // ------------------------------------------------------------------ helpers
+
+  function makeRng(seed) {
+    var a = (seed >>> 0) || 1;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function shuffleInPlace(arr, rng) {
+    for (var i = arr.length - 1; i > 0; i--) {
+      var j = Math.floor(rng() * (i + 1));
+      var t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+    }
+    return arr;
+  }
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function popcount(x) { var c = 0; while (x) { x &= x - 1; c++; } return c; }
+
+  // ------------------------------------------------------- level construction
+
+  /**
+   * Build a level from an explicit specification. Hand-written tests and the
+   * generator both go through here so validation is shared.
+   *
+   * spec = {
+   *   map: [ '..#..', '..X.. ' ]   '.' playable  '#' rock  'X' crate  ' ' void
+   *   holes:     [ { color, c, r } ]
+   *   crates:    [ { color, c, r } ]
+   *   gates:     [ { color, c, r } ]
+   *   creatures: [ { color, cells:[[c,r],...], ice } ]   cells[0] is the HEAD
+   * }
+   */
+  function buildLevel(spec) {
+    var map = spec.map;
+    var rows = map.length;
+    var cols = 0;
+    var i, r, c;
+    for (r = 0; r < rows; r++) { if (map[r].length > cols) cols = map[r].length; }
+    var n = cols * rows;
+    var region = new Uint8Array(n);
+    var wall = new Uint8Array(n);
+    var crate = new Uint8Array(n);      // 0 = none, else colour + 1
+    var gate = new Uint8Array(n);       // 0 = none, else colour + 1
+
+    for (r = 0; r < rows; r++) {
+      for (c = 0; c < cols; c++) {
+        var ch = map[r].charAt(c) || ' ';
+        var k = c + r * cols;
+        if (ch === '.') { region[k] = 1; }
+        else if (ch === '#') { region[k] = 1; wall[k] = 1; }
+        else if (ch === 'X' || ch === 'x') { region[k] = 1; crate[k] = 10; }
+      }
+    }
+    (spec.crates || []).forEach(function (b) {
+      var k = b.c + b.r * cols;
+      if (!region[k]) throw new Error('crate at (' + b.c + ',' + b.r + ') is off the playable region');
+      crate[k] = (b.color === undefined ? 9 : b.color) + 1;
+    });
+    (spec.gates || []).forEach(function (g) {
+      var k = g.c + g.r * cols;
+      if (!region[k]) throw new Error('gate at (' + g.c + ',' + g.r + ') is off the playable region');
+      if (wall[k] || crate[k]) throw new Error('gate at (' + g.c + ',' + g.r + ') collides with an obstacle');
+      gate[k] = g.color + 1;
+    });
+
+    var holes = (spec.holes || []).map(function (h, k) {
+      var hi = h.c + h.r * cols;
+      if (h.c < 0 || h.r < 0 || h.c >= cols || h.r >= rows) throw new Error('hole ' + k + ' out of grid bounds');
+      if (region[hi]) throw new Error('hole ' + k + ' sits on a playable cell');
+      var mouths = [];
+      for (var d = 0; d < 4; d++) {
+        var mc = h.c + DIRS[d].dc, mr = h.r + DIRS[d].dr;
+        if (mc < 0 || mr < 0 || mc >= cols || mr >= rows) continue;
+        var mi = mc + mr * cols;
+        if (region[mi] && !wall[mi] && !crate[mi]) mouths.push(mi);
+      }
+      if (!mouths.length) throw new Error('hole ' + k + ' touches no playable cell');
+      return { id: k, color: h.color, c: h.c, r: h.r, index: hi, mouths: mouths,
+               facing: facingOf(h.c, h.r, mouths[0], cols) };
+    });
+
+    var creatures = (spec.creatures || []).map(function (cr, k) {
+      var cells = cr.cells.map(function (p) {
+        var ci = p[0] + p[1] * cols;
+        if (p[0] < 0 || p[1] < 0 || p[0] >= cols || p[1] >= rows) throw new Error('creature ' + k + ' cell out of bounds');
+        if (!region[ci] || wall[ci] || crate[ci]) {
+          throw new Error('creature ' + k + ' cell (' + p[0] + ',' + p[1] + ') is not free playable');
+        }
+        if (gate[ci] && gate[ci] - 1 !== cr.color) {
+          throw new Error('creature ' + k + ' starts on a gate of another colour');
+        }
+        return ci;
+      });
+      for (var q = 1; q < cells.length; q++) {
+        if (!adjacent(cells[q - 1], cells[q], cols)) throw new Error('creature ' + k + ' chain is not contiguous at segment ' + q);
+      }
+      for (var a = 0; a < cells.length; a++) {
+        for (var b = a + 1; b < cells.length; b++) {
+          if (cells[a] === cells[b]) throw new Error('creature ' + k + ' chain self-overlaps');
+        }
+      }
+      var holeId = cr.holeId;
+      if (holeId === undefined || holeId === null) {
+        for (i = 0; i < holes.length; i++) { if (holes[i].color === cr.color) { holeId = holes[i].id; break; } }
+      }
+      return { id: k, color: cr.color, cells: cells, ice: cr.ice || 0,
+               holeId: (holeId === undefined ? -1 : holeId) };
+    });
+
+    var seen = {};
+    creatures.forEach(function (cr) {
+      cr.cells.forEach(function (ci) {
+        if (seen[ci] !== undefined) throw new Error('creatures ' + seen[ci] + ' and ' + cr.id + ' overlap at cell ' + ci);
+        seen[ci] = cr.id;
+      });
+    });
+
+    return {
+      level: spec.level || 0,
+      tier: spec.tier || 0,
+      cols: cols, rows: rows,
+      region: Array.prototype.slice.call(region),
+      wall: Array.prototype.slice.call(wall),
+      crate: Array.prototype.slice.call(crate),
+      gate: Array.prototype.slice.call(gate),
+      holes: holes,
+      creatures: creatures,
+      timeLimit: spec.timeLimit || 120,
+      parMoves: spec.parMoves || 0,
+      seed: spec.seed || 0,
+      difficulty: spec.difficulty || null,
+      buildOrder: spec.buildOrder || null
+    };
+  }
+
+  function adjacent(a, b, cols) {
+    var ac = a % cols, ar = (a - ac) / cols;
+    var bc = b % cols, br = (b - bc) / cols;
+    return Math.abs(ac - bc) + Math.abs(ar - br) === 1;
+  }
+  function facingOf(hc, hr, mouthIndex, cols) {
+    var mc = mouthIndex % cols, mr = (mouthIndex - mc) / cols;
+    for (var d = 0; d < 4; d++) { if (hc + DIRS[d].dc === mc && hr + DIRS[d].dr === mr) return d; }
+    return 0;
+  }
+
+  // ------------------------------------------------------------------ Game
+
+  function Game(level) {
+    if (!level) throw new Error('Game requires a level');
+    this.level = level;
+    this.cols = level.cols;
+    this.rows = level.rows;
+    var n = this.cols * this.rows;
+
+    this.region = Uint8Array.from(level.region);
+    this.wall = Uint8Array.from(level.wall);
+    this.crate = Uint8Array.from(level.crate || new Array(n).fill(0));
+    this.gate = Uint8Array.from(level.gate || new Array(n).fill(0));
+
+    // impassable for EVERY creature: void, rock or crate
+    this.blockedStatic = new Uint8Array(n);
+    for (var i = 0; i < n; i++) {
+      this.blockedStatic[i] = (!this.region[i] || this.wall[i] || this.crate[i]) ? 1 : 0;
+    }
+
+    this.holes = level.holes.map(function (h) {
+      return { id: h.id, color: h.color, c: h.c, r: h.r, index: h.index,
+               mouths: h.mouths.slice(), facing: h.facing };
+    });
+    this.holeAt = new Int16Array(n);
+    for (var k = 0; k < n; k++) this.holeAt[k] = -1;
+    this.holes.forEach(function (h) { this.holeAt[h.index] = h.id; }, this);
+
+    this.creatures = level.creatures.map(function (cr) {
+      return {
+        id: cr.id, color: cr.color, holeId: cr.holeId,
+        cells: cr.cells.slice(),
+        startCells: cr.cells.slice(),
+        ice: cr.ice || 0, startIce: cr.ice || 0,
+        exited: false, feeding: -1, exitRank: -1
+      };
+    });
+
+    this.occ = new Int16Array(n);
+    this.moves = 0;
+    this.exitCount = 0;
+    this.history = [];
+    this._pending = null;
+    this._rebuildOcc();
+    this._initial = this.snapshot();
+  }
+
+  Game.prototype.idx = function (c, r) { return c + r * this.cols; };
+  Game.prototype.colOf = function (i) { return i % this.cols; };
+  Game.prototype.rowOf = function (i) { return (i - (i % this.cols)) / this.cols; };
+  Game.prototype.inBounds = function (c, r) { return c >= 0 && r >= 0 && c < this.cols && r < this.rows; };
+  Game.prototype.isPlayable = function (c, r) { return this.inBounds(c, r) && !!this.region[this.idx(c, r)]; };
+  Game.prototype.isWall = function (c, r) { return this.inBounds(c, r) && !!this.wall[this.idx(c, r)]; };
+  Game.prototype.isCrate = function (c, r) { return this.inBounds(c, r) && !!this.crate[this.idx(c, r)]; };
+  Game.prototype.gateColorAt = function (c, r) {
+    if (!this.inBounds(c, r)) return -1;
+    var g = this.gate[this.idx(c, r)];
+    return g ? g - 1 : -1;
+  };
+
+  Game.prototype._rebuildOcc = function () {
+    var n = this.cols * this.rows, i;
+    for (i = 0; i < n; i++) this.occ[i] = -1;
+    for (i = 0; i < this.creatures.length; i++) {
+      var cr = this.creatures[i];
+      if (cr.exited) continue;
+      for (var j = 0; j < cr.cells.length; j++) this.occ[cr.cells[j]] = cr.id;
+    }
+  };
+
+  Game.prototype.occupantAt = function (c, r) {
+    if (!this.inBounds(c, r)) return -1;
+    return this.occ[this.idx(c, r)];
+  };
+  Game.prototype.isFreeCell = function (c, r) {
+    if (!this.inBounds(c, r)) return false;
+    var i = this.idx(c, r);
+    return !this.blockedStatic[i] && this.occ[i] < 0;
+  };
+  Game.prototype.headOf = function (id) {
+    var cr = this.creatures[id];
+    if (!cr || !cr.cells.length) return null;
+    return { c: this.colOf(cr.cells[0]), r: this.rowOf(cr.cells[0]) };
+  };
+  Game.prototype.cellsOf = function (id) {
+    var self = this;
+    return this.creatures[id].cells.map(function (i) { return { c: self.colOf(i), r: self.rowOf(i) }; });
+  };
+
+  /**
+   * Attempt one head step.  Returns
+   *   { ok, type:'move'|'feed', reason?, exited?, shattered?, from?, to?, holeId? }
+   *
+   * Rejection reasons: nocreature exited iced baddir outside wall crate gate
+   *                    self other feeding wronghole
+   */
+  Game.prototype.stepHead = function (id, dir) {
+    var cr = this.creatures[id];
+    if (!cr) return { ok: false, reason: 'nocreature' };
+    if (cr.exited) return { ok: false, reason: 'exited' };
+    if (cr.ice > 0) return { ok: false, reason: 'iced', ice: cr.ice };
+    if (!(dir >= 0 && dir < 4) || dir !== (dir | 0)) return { ok: false, reason: 'baddir' };
+
+    var head = cr.cells[0];
+    var hc = this.colOf(head), hr = this.rowOf(head);
+    var nc = hc + DIRS[dir].dc, nr = hr + DIRS[dir].dr;
+    if (!this.inBounds(nc, nr)) return { ok: false, reason: 'outside' };
+    var ni = this.idx(nc, nr);
+
+    var hid = this.holeAt[ni];
+    if (hid >= 0) {
+      var hole = this.holes[hid];
+      if (hole.color !== cr.color) return { ok: false, reason: 'wronghole' };
+      // ---- feed step: cells.pop()
+      cr.feeding = hid;
+      var gone = cr.cells.pop();
+      this.occ[gone] = -1;
+      this.moves++;
+      var shattered = null;
+      if (cr.cells.length === 0) {
+        cr.exited = true;
+        cr.exitRank = this.exitCount++;
+        shattered = this._tickIce(cr.id);
+      }
+      return { ok: true, type: 'feed', holeId: hid, exited: cr.exited, vacated: gone, shattered: shattered };
+    }
+
+    if (cr.feeding >= 0) return { ok: false, reason: 'feeding' };
+    if (this.blockedStatic[ni]) {
+      return { ok: false, reason: this.wall[ni] ? 'wall' : (this.crate[ni] ? 'crate' : 'outside') };
+    }
+    if (this.gate[ni] && this.gate[ni] - 1 !== cr.color) {
+      return { ok: false, reason: 'gate', gateColor: this.gate[ni] - 1 };
+    }
+    var occId = this.occ[ni];
+    if (occId >= 0) return { ok: false, reason: occId === id ? 'self' : 'other', blockerId: occId };
+
+    // ---- normal snake-follow step
+    this.occ[ni] = id;
+    cr.cells.unshift(ni);
+    var tail = cr.cells.pop();
+    this.occ[tail] = -1;
+    this.moves++;
+    return { ok: true, type: 'move', from: head, to: ni, vacated: tail };
+  };
+
+  /** Every OTHER creature's ice counter drops by one when a creature exits. */
+  Game.prototype._tickIce = function (exitedId) {
+    var shattered = [];
+    for (var i = 0; i < this.creatures.length; i++) {
+      var o = this.creatures[i];
+      if (o.id === exitedId || o.exited || o.ice <= 0) continue;
+      o.ice--;
+      if (o.ice === 0) shattered.push(o.id);
+    }
+    return shattered.length ? shattered : null;
+  };
+
+  /** Non-mutating legality probe. Same reason codes as stepHead. */
+  Game.prototype.canStep = function (id, dir) {
+    var cr = this.creatures[id];
+    if (!cr || cr.exited) return { ok: false, reason: cr ? 'exited' : 'nocreature' };
+    if (cr.ice > 0) return { ok: false, reason: 'iced', ice: cr.ice };
+    if (!(dir >= 0 && dir < 4) || dir !== (dir | 0)) return { ok: false, reason: 'baddir' };
+    var head = cr.cells[0];
+    var nc = this.colOf(head) + DIRS[dir].dc, nr = this.rowOf(head) + DIRS[dir].dr;
+    if (!this.inBounds(nc, nr)) return { ok: false, reason: 'outside' };
+    var ni = this.idx(nc, nr);
+    var hid = this.holeAt[ni];
+    if (hid >= 0) {
+      return this.holes[hid].color === cr.color
+        ? { ok: true, type: 'feed', holeId: hid }
+        : { ok: false, reason: 'wronghole' };
+    }
+    if (cr.feeding >= 0) return { ok: false, reason: 'feeding' };
+    if (this.blockedStatic[ni]) {
+      return { ok: false, reason: this.wall[ni] ? 'wall' : (this.crate[ni] ? 'crate' : 'outside') };
+    }
+    if (this.gate[ni] && this.gate[ni] - 1 !== cr.color) return { ok: false, reason: 'gate', gateColor: this.gate[ni] - 1 };
+    if (this.occ[ni] >= 0) return { ok: false, reason: this.occ[ni] === id ? 'self' : 'other', blockerId: this.occ[ni] };
+    return { ok: true, type: 'move' };
+  };
+
+  Game.prototype.feedOnce = function (id) {
+    var cr = this.creatures[id];
+    if (!cr || cr.exited) return { ok: false, reason: 'exited' };
+    var hid = cr.feeding;
+    if (hid < 0) return { ok: false, reason: 'notfeeding' };
+    var hole = this.holes[hid];
+    var head = cr.cells[0];
+    for (var d = 0; d < 4; d++) {
+      if (this.colOf(head) + DIRS[d].dc === hole.c && this.rowOf(head) + DIRS[d].dr === hole.r) {
+        return this.stepHead(id, d);
+      }
+    }
+    return { ok: false, reason: 'notatmouth' };
+  };
+
+  Game.prototype.isWon = function () {
+    for (var i = 0; i < this.creatures.length; i++) { if (!this.creatures[i].exited) return false; }
+    return true;
+  };
+  Game.prototype.remainingCount = function () {
+    var n = 0;
+    for (var i = 0; i < this.creatures.length; i++) { if (!this.creatures[i].exited) n++; }
+    return n;
+  };
+
+  // ------------------------------------------------------- snapshots / undo
+
+  Game.prototype.snapshot = function () {
+    return {
+      cells: this.creatures.map(function (c) { return c.cells.slice(); }),
+      exited: this.creatures.map(function (c) { return c.exited; }),
+      feeding: this.creatures.map(function (c) { return c.feeding; }),
+      ice: this.creatures.map(function (c) { return c.ice; }),
+      exitRank: this.creatures.map(function (c) { return c.exitRank; }),
+      moves: this.moves,
+      exitCount: this.exitCount
+    };
+  };
+  Game.prototype.restore = function (snap) {
+    for (var i = 0; i < this.creatures.length; i++) {
+      var cr = this.creatures[i];
+      cr.cells = snap.cells[i].slice();
+      cr.exited = snap.exited[i];
+      cr.feeding = snap.feeding[i];
+      cr.ice = snap.ice[i];
+      cr.exitRank = snap.exitRank[i];
+    }
+    this.moves = snap.moves;
+    this.exitCount = snap.exitCount;
+    this._rebuildOcc();
+  };
+  Game.prototype.beginGesture = function () {
+    if (this._pending) return;
+    this._pending = { snap: this.snapshot(), moves: this.moves };
+  };
+  Game.prototype.endGesture = function () {
+    if (!this._pending) return false;
+    var changed = this.moves !== this._pending.moves;
+    if (changed) {
+      this.history.push(this._pending.snap);
+      if (this.history.length > 200) this.history.shift();
+    }
+    this._pending = null;
+    return changed;
+  };
+  Game.prototype.canUndo = function () { return this.history.length > 0; };
+  Game.prototype.undo = function () {
+    if (!this.history.length) return false;
+    this.restore(this.history.pop());
+    this._pending = null;
+    return true;
+  };
+  Game.prototype.restart = function () {
+    this.restore(this._initial);
+    this.history.length = 0;
+    this._pending = null;
+  };
+
+  // =====================================================================
+  // SOLVER (independent of the generator's construction record)
+  // =====================================================================
+  //
+  //  Layer 1  snakeSearch()          A* over snake body configurations. Proves a
+  //                                  creature can walk its head onto a mouth of a
+  //                                  colour-matching hole. (Once the head is on a
+  //                                  mouth, feeding is ALWAYS legal - a feed step
+  //                                  only pops the tail, it never needs a cell.)
+  //  Layer 2  solveFast()            DFS over the exited-creature bitmask assuming
+  //                                  nobody is ever repositioned. COMPLETE over
+  //                                  that class, so a failure PROVES the level
+  //                                  requires repositioning.
+  //  Layer 3  solveWithReposition()  adds bounded "move a creature without
+  //                                  exiting it" macro actions.
+
+  function buildDistanceField(cols, rows, blocked, goals) {
+    var n = cols * rows;
+    var dist = new Int32Array(n);
+    for (var i = 0; i < n; i++) dist[i] = 0x7fffffff;
+    var q = [], qh = 0;
+    for (var g = 0; g < goals.length; g++) {
+      if (dist[goals[g]] !== 0) { dist[goals[g]] = 0; q.push(goals[g]); }
+    }
+    while (qh < q.length) {
+      var cur = q[qh++];
+      var cc = cur % cols, cr = (cur - cc) / cols;
+      var nd = dist[cur] + 1;
+      for (var d = 0; d < 4; d++) {
+        var nc = cc + DIRS[d].dc, nr = cr + DIRS[d].dr;
+        if (nc < 0 || nr < 0 || nc >= cols || nr >= rows) continue;
+        var ni = nc + nr * cols;
+        if (blocked[ni]) continue;
+        if (dist[ni] > nd) { dist[ni] = nd; q.push(ni); }
+      }
+    }
+    return dist;
+  }
+
+  function keyOf(body) {
+    var s = '';
+    for (var i = 0; i < body.length; i++) s += String.fromCharCode(body[i]);
+    return s;
+  }
+
+  function Heap() { this.a = []; }
+  Heap.prototype.push = function (node) {
+    var a = this.a; a.push(node);
+    var i = a.length - 1;
+    while (i > 0) {
+      var p = (i - 1) >> 1;
+      if (a[p].f <= a[i].f) break;
+      var t = a[p]; a[p] = a[i]; a[i] = t; i = p;
+    }
+  };
+  Heap.prototype.pop = function () {
+    var a = this.a;
+    if (!a.length) return null;
+    var top = a[0], last = a.pop();
+    if (a.length) {
+      a[0] = last;
+      var i = 0;
+      for (;;) {
+        var l = 2 * i + 1, r = l + 1, m = i;
+        if (l < a.length && a[l].f < a[m].f) m = l;
+        if (r < a.length && a[r].f < a[m].f) m = r;
+        if (m === i) break;
+        var t = a[m]; a[m] = a[i]; a[i] = t; i = m;
+      }
+    }
+    return top;
+  };
+  Heap.prototype.size = function () { return this.a.length; };
+
+  /**
+   * A* over snake configurations.
+   * blocked: 1 = impassable FOR THIS CREATURE (void / rock / crate /
+   *          wrong-colour gate / another creature). goals = mouth cells.
+   */
+  function snakeSearch(cols, rows, blocked, body, goals, nodeCap) {
+    nodeCap = nodeCap || 250000;
+    if (!goals.length) return { found: false, path: null, nodes: 0 };
+
+    var goalSet = Object.create(null);
+    for (var gi = 0; gi < goals.length; gi++) goalSet[goals[gi]] = 1;
+    if (goalSet[body[0]]) return { found: true, path: [], nodes: 0 };
+
+    var dist = buildDistanceField(cols, rows, blocked, goals);
+    if (dist[body[0]] === 0x7fffffff) return { found: false, path: null, nodes: 0 };
+
+    var open = new Heap();
+    var seen = Object.create(null);
+    var start = { body: body.slice(), g: 0, f: dist[body[0]], parent: null, dir: -1 };
+    seen[keyOf(start.body)] = 0;
+    open.push(start);
+    var nodes = 0;
+
+    while (open.size()) {
+      var cur = open.pop();
+      nodes++;
+      if (nodes > nodeCap) return { found: false, path: null, nodes: nodes, capped: true };
+
+      var head = cur.body[0];
+      if (goalSet[head]) {
+        var path = [], p = cur;
+        while (p && p.dir >= 0) { path.push(p.dir); p = p.parent; }
+        path.reverse();
+        return { found: true, path: path, nodes: nodes };
+      }
+
+      var hc = head % cols, hr = (head - hc) / cols;
+      for (var d = 0; d < 4; d++) {
+        var nc = hc + DIRS[d].dc, nr = hr + DIRS[d].dr;
+        if (nc < 0 || nr < 0 || nc >= cols || nr >= rows) continue;
+        var ni = nc + nr * cols;
+        if (blocked[ni]) continue;
+        var self = false;
+        for (var b = 0; b < cur.body.length; b++) { if (cur.body[b] === ni) { self = true; break; } }
+        if (self) continue;
+        if (dist[ni] === 0x7fffffff) continue;
+
+        var nb = cur.body.slice();
+        nb.unshift(ni); nb.pop();
+        var k = keyOf(nb);
+        var ng = cur.g + 1;
+        if (seen[k] !== undefined && seen[k] <= ng) continue;
+        seen[k] = ng;
+        open.push({ body: nb, g: ng, f: ng + dist[ni], parent: cur, dir: d });
+      }
+    }
+    return { found: false, path: null, nodes: nodes };
+  }
+
+  /** Every configuration a creature can reach within maxSteps. */
+  function reachableConfigs(cols, rows, blocked, body, maxSteps, cap) {
+    cap = cap || 3000;
+    var out = [];
+    var seen = Object.create(null);
+    seen[keyOf(body)] = 1;
+    var frontier = [{ body: body.slice(), path: [] }];
+    for (var step = 0; step < maxSteps && out.length < cap; step++) {
+      var next = [];
+      for (var f = 0; f < frontier.length && out.length < cap; f++) {
+        var cur = frontier[f];
+        var head = cur.body[0];
+        var hc = head % cols, hr = (head - hc) / cols;
+        for (var d = 0; d < 4; d++) {
+          var nc = hc + DIRS[d].dc, nr = hr + DIRS[d].dr;
+          if (nc < 0 || nr < 0 || nc >= cols || nr >= rows) continue;
+          var ni = nc + nr * cols;
+          if (blocked[ni]) continue;
+          var self = false;
+          for (var b = 0; b < cur.body.length; b++) { if (cur.body[b] === ni) { self = true; break; } }
+          if (self) continue;
+          var nb = cur.body.slice();
+          nb.unshift(ni); nb.pop();
+          var k = keyOf(nb);
+          if (seen[k]) continue;
+          seen[k] = 1;
+          var rec = { body: nb, path: cur.path.concat([d]) };
+          next.push(rec);
+          out.push(rec);
+          if (out.length >= cap) break;
+        }
+      }
+      if (!next.length) break;
+      frontier = next;
+    }
+    return out;
+  }
+
+  function mouthsForColor(level, color) {
+    var out = [];
+    for (var i = 0; i < level.holes.length; i++) {
+      if (level.holes[i].color !== color) continue;
+      for (var m = 0; m < level.holes[i].mouths.length; m++) out.push(level.holes[i].mouths[m]);
+    }
+    return out;
+  }
+
+  /** Shared immutable context for all solver layers. */
+  function solverContext(level) {
+    var cols = level.cols, rows = level.rows, n = cols * rows;
+    var N = level.creatures.length;
+    var crateArr = level.crate || [];
+    var gateArr = level.gate || [];
+    var staticBlocked = new Uint8Array(n);
+    for (var i = 0; i < n; i++) {
+      staticBlocked[i] = (!level.region[i] || level.wall[i] || crateArr[i]) ? 1 : 0;
+    }
+    var byColor = {};
+    function staticForColor(color) {
+      if (byColor[color]) return byColor[color];
+      var arr = staticBlocked.slice();
+      for (var k = 0; k < n; k++) {
+        if (gateArr[k] && gateArr[k] - 1 !== color) arr[k] = 1;
+      }
+      byColor[color] = arr;
+      return arr;
+    }
+    return {
+      level: level, cols: cols, rows: rows, n: n, N: N,
+      staticBlocked: staticBlocked,
+      staticForColor: staticForColor,
+      goals: level.creatures.map(function (c) { return mouthsForColor(level, c.color); }),
+      ice: level.creatures.map(function (c) { return c.ice || 0; }),
+      colors: level.creatures.map(function (c) { return c.color; })
+    };
+  }
+
+  /** Blocked field for creature `id` given everyone still present. */
+  function blockedFor(ctx, id, bodies, present) {
+    var arr = ctx.staticForColor(ctx.colors[id]).slice();
+    for (var j = 0; j < ctx.N; j++) {
+      if (j === id || !(present & (1 << j))) continue;
+      var bj = bodies[j];
+      for (var q = 0; q < bj.length; q++) arr[bj[q]] = 1;
+    }
+    return arr;
+  }
+
+  /**
+   * Layer 2. Complete over solutions where no creature is moved except on its
+   * way out. Returns { solvable, order, plans, branching, steps, exitableAtStart }.
+   */
+  function solveFast(ctx, opts) {
+    opts = opts || {};
+    var nodeCap = opts.nodeCap || 250000;
+    var bodies = ctx.level.creatures.map(function (c) { return c.cells.slice(); });
+    var canExitMemo = Object.create(null);
+    var totalNodes = 0;
+
+    function canExit(id, present) {
+      // ice: frozen until `ice` other creatures have left
+      var exitedCount = ctx.N - popcount(present);
+      if (ctx.ice[id] > exitedCount) return null;
+      var mk = id + '|' + present;
+      var cached = canExitMemo[mk];
+      if (cached !== undefined) return cached;
+      var res = snakeSearch(ctx.cols, ctx.rows, blockedFor(ctx, id, bodies, present),
+                            bodies[id], ctx.goals[id], nodeCap);
+      totalNodes += res.nodes || 0;
+      var out = res.found ? (res.path || []) : null;
+      canExitMemo[mk] = out;
+      return out;
+    }
+    function exitableAt(present) {
+      var options = [];
+      for (var id = 0; id < ctx.N; id++) {
+        if (!(present & (1 << id))) continue;
+        var path = canExit(id, present);
+        if (path) options.push({ id: id, path: path });
+      }
+      return options;
+    }
+
+    var failed = Object.create(null);
+    var order = [], plans = Object.create(null), branching = [];
+    var full = (1 << ctx.N) - 1;
+
+    function dfs(present) {
+      if (present === 0) return true;
+      if (failed[present]) return false;
+      var options = exitableAt(present);
+      if (!options.length) { failed[present] = 1; return false; }
+      options.sort(function (a, b) { return a.path.length - b.path.length; });
+      for (var k = 0; k < options.length; k++) {
+        order.push(options[k].id);
+        plans[options[k].id] = options[k].path;
+        branching.push(options.length);
+        if (dfs(present & ~(1 << options[k].id))) return true;
+        branching.pop();
+        order.pop();
+        delete plans[options[k].id];
+      }
+      failed[present] = 1;
+      return false;
+    }
+
+    var ok = ctx.N === 0 ? true : dfs(full);
+    var steps = 0;
+    if (ok) {
+      for (var i = 0; i < order.length; i++) {
+        steps += plans[order[i]].length + ctx.level.creatures[order[i]].cells.length;
+      }
+    }
+
+    // Order rigidity, counted with the SAME memo - a second independent pass
+    // over the mask lattice was the single most expensive thing in generation.
+    var orderCount = 0;
+    if (ok && opts.countOrders) {
+      var cap = opts.orderCap || 24;
+      (function countDfs(present) {
+        if (orderCount >= cap) return;
+        if (present === 0) { orderCount++; return; }
+        for (var id = 0; id < ctx.N && orderCount < cap; id++) {
+          if (!(present & (1 << id))) continue;
+          if (!canExit(id, present)) continue;
+          countDfs(present & ~(1 << id));
+        }
+      })(full);
+    }
+
+    return {
+      solvable: ok,
+      order: ok ? order.slice() : null,
+      plans: ok ? plans : null,
+      branching: ok ? branching.slice() : null,
+      steps: steps, repositions: 0, nodes: totalNodes,
+      orderCount: orderCount,
+      exitableAtStart: exitableAt(full).length
+    };
+  }
+
+  /**
+   * Layer 3. Bounded "move a creature without exiting it" macro actions.
+   * Returns { solvable, actions:[{kind:'exit'|'move', id, path}], repositions }.
+   */
+  function solveWithReposition(ctx, opts) {
+    opts = opts || {};
+    var budget = opts.repositionBudget === undefined ? 3 : opts.repositionBudget;
+    var nodeCap = opts.nodeCap || 120000;
+    // Repositioning episodes built by the generator are 2-5 steps long, so a
+    // 10-step horizon is ample and keeps the config enumeration cheap. On a
+    // densely packed board the reachable set is tiny anyway.
+    var maxSteps = opts.repositionSteps || 10;
+    var configCap = opts.configCap || 260;
+    var stateCap = opts.stateCap || 12000;
+    var branchCap = opts.repositionBranch || 14;
+    var deadline = Date.now() + (opts.timeBudgetMs || 1200);
+
+    var startBodies = ctx.level.creatures.map(function (c) { return c.cells.slice(); });
+    var visited = Object.create(null);
+    var states = 0;
+    var actions = [];
+
+    function stateKey(bodies, present) {
+      var s = present + '|';
+      for (var i = 0; i < ctx.N; i++) {
+        if (!(present & (1 << i))) continue;
+        s += i + ':' + keyOf(bodies[i]) + ';';
+      }
+      return s;
+    }
+    function exitOptions(bodies, present) {
+      var out = [];
+      var exitedCount = ctx.N - popcount(present);
+      for (var id = 0; id < ctx.N; id++) {
+        if (!(present & (1 << id))) continue;
+        if (ctx.ice[id] > exitedCount) continue;
+        var res = snakeSearch(ctx.cols, ctx.rows, blockedFor(ctx, id, bodies, present),
+                              bodies[id], ctx.goals[id], nodeCap);
+        if (res.found) out.push({ id: id, path: res.path || [] });
+      }
+      out.sort(function (a, b) { return a.path.length - b.path.length; });
+      return out;
+    }
+
+    function search(bodies, present, repoLeft) {
+      if (present === 0) return true;
+      if (++states > stateCap) return false;
+      if ((states & 63) === 0 && Date.now() > deadline) return false;
+      var key = stateKey(bodies, present);
+      if (visited[key]) return false;
+      visited[key] = 1;
+
+      var exits = exitOptions(bodies, present);
+      for (var i = 0; i < exits.length; i++) {
+        actions.push({ kind: 'exit', id: exits[i].id, path: exits[i].path });
+        if (search(bodies, present & ~(1 << exits[i].id), repoLeft)) return true;
+        actions.pop();
+      }
+      if (repoLeft <= 0) return false;
+
+      var exitedCount = ctx.N - popcount(present);
+      var candidates = [];
+      for (var y = 0; y < ctx.N; y++) {
+        if (!(present & (1 << y))) continue;
+        if (ctx.ice[y] > exitedCount) continue;
+        var blocked = blockedFor(ctx, y, bodies, present);
+        var cfgs = reachableConfigs(ctx.cols, ctx.rows, blocked, bodies[y], maxSteps, configCap);
+        for (var c = 0; c < cfgs.length; c++) {
+          var vacated = 0;
+          for (var q = 0; q < bodies[y].length; q++) {
+            if (cfgs[c].body.indexOf(bodies[y][q]) < 0) vacated++;
+          }
+          if (!vacated) continue;
+          candidates.push({ id: y, body: cfgs[c].body, path: cfgs[c].path, vacated: vacated });
+        }
+      }
+      candidates.sort(function (a, b) {
+        return (b.vacated - a.vacated) || (a.path.length - b.path.length);
+      });
+      for (var k = 0; k < candidates.length && k < branchCap; k++) {
+        var cand = candidates[k];
+        var nb = bodies.slice();
+        nb[cand.id] = cand.body;
+        actions.push({ kind: 'move', id: cand.id, path: cand.path });
+        if (search(nb, present, repoLeft - 1)) return true;
+        actions.pop();
+      }
+      return false;
+    }
+
+    for (var b = 1; b <= budget; b++) {
+      visited = Object.create(null);
+      states = 0;
+      actions = [];
+      if (search(startBodies, (1 << ctx.N) - 1, b)) {
+        var repos = actions.filter(function (a) { return a.kind === 'move'; }).length;
+        var steps = 0;
+        actions.forEach(function (a) {
+          steps += a.path.length;
+          if (a.kind === 'exit') steps += ctx.level.creatures[a.id].cells.length;
+        });
+        return { solvable: true, actions: actions.slice(), repositions: repos, steps: steps, states: states };
+      }
+    }
+    return { solvable: false, actions: null, repositions: 0, steps: 0, states: states };
+  }
+
+  /**
+   * Public solver. Tries the fast (no-repositioning) search first and only
+   * escalates when that proves repositioning is genuinely required.
+   */
+  function solveLevel(level, opts) {
+    opts = opts || {};
+    var ctx = opts._ctx || solverContext(level);
+    var fast = solveFast(ctx, opts);
+    if (fast.solvable) { fast.mode = 'direct'; return fast; }
+    if (opts.fastOnly) { fast.mode = 'direct'; return fast; }
+    if (opts.allowReposition === false) { fast.mode = 'direct'; return fast; }
+    var deep = solveWithReposition(ctx, opts);
+    if (!deep.solvable) {
+      return { solvable: false, order: null, plans: null, steps: 0, repositions: 0,
+               mode: 'reposition', nodes: fast.nodes, exitableAtStart: fast.exitableAtStart };
+    }
+    var order = deep.actions.filter(function (a) { return a.kind === 'exit'; }).map(function (a) { return a.id; });
+    return {
+      solvable: true, mode: 'reposition',
+      order: order, plans: null, actions: deep.actions,
+      steps: deep.steps, repositions: deep.repositions,
+      branching: null, nodes: fast.nodes, states: deep.states,
+      exitableAtStart: fast.exitableAtStart
+    };
+  }
+
+  /** Count distinct valid exit orders (no repositioning), capped. */
+  function countExitOrders(ctx, cap, nodeCap) {
+    cap = cap || 48;
+    var bodies = ctx.level.creatures.map(function (c) { return c.cells.slice(); });
+    var memo = Object.create(null);
+    var found = 0;
+    function canExit(id, present) {
+      var exitedCount = ctx.N - popcount(present);
+      if (ctx.ice[id] > exitedCount) return false;
+      var mk = id + '|' + present;
+      if (memo[mk] !== undefined) return memo[mk];
+      var res = snakeSearch(ctx.cols, ctx.rows, blockedFor(ctx, id, bodies, present),
+                            bodies[id], ctx.goals[id], nodeCap || 120000);
+      memo[mk] = res.found;
+      return res.found;
+    }
+    function dfs(present) {
+      if (found >= cap) return;
+      if (present === 0) { found++; return; }
+      for (var id = 0; id < ctx.N && found < cap; id++) {
+        if (!(present & (1 << id))) continue;
+        if (!canExit(id, present)) continue;
+        dfs(present & ~(1 << id));
+      }
+    }
+    dfs((1 << ctx.N) - 1);
+    return found;
+  }
+
+  // =====================================================================
+  // DIFFICULTY MEASUREMENT
+  // =====================================================================
+
+  var DIFF_WEIGHTS = { free: 30, branch: 26, blocked: 14, obstacles: 10, count: 10, maneuver: 6, rigidity: 4 };
+
+  /**
+   * Measure how hard a level actually is. Every input comes from the
+   * INDEPENDENT solver - nothing here consults the generator's build record.
+   */
+  function analyzeLevel(level, opts) {
+    opts = opts || {};
+    var ctx = solverContext(level);
+    var n = level.cols * level.rows;
+    var crateArr = level.crate || [], gateArr = level.gate || [];
+
+    var playable = 0, rocks = 0, crates = 0, gates = 0;
+    for (var i = 0; i < n; i++) {
+      if (!level.region[i]) continue;
+      if (level.wall[i]) { rocks++; continue; }
+      if (crateArr[i]) { crates++; continue; }
+      playable++;
+      if (gateArr[i]) gates++;
+    }
+    var occupied = 0, iceCount = 0, iceTotal = 0;
+    level.creatures.forEach(function (c) {
+      occupied += c.cells.length;
+      if (c.ice > 0) { iceCount++; iceTotal += c.ice; }
+    });
+    var freeCells = playable - occupied;
+    var freeRatio = playable > 0 ? freeCells / playable : 1;
+
+    var sol = solveLevel(level, {
+      _ctx: ctx,
+      nodeCap: opts.nodeCap || 250000,
+      countOrders: !opts.skipOrderCount,
+      orderCap: opts.orderCap || 24,
+      repositionBudget: opts.repositionBudget === undefined ? 3 : opts.repositionBudget
+    });
+    if (!sol.solvable) {
+      return { solvable: false, score: 0, label: 'UNSOLVABLE', freeRatio: freeRatio,
+               playable: playable, freeCells: freeCells, creatures: ctx.N,
+               obstacles: { rocks: rocks, crates: crates, gates: gates, ice: iceCount, iceTotal: iceTotal } };
+    }
+
+    var avgBranch;
+    if (sol.branching && sol.branching.length) {
+      var s = 0;
+      for (var b = 0; b < sol.branching.length; b++) s += sol.branching[b];
+      avgBranch = s / sol.branching.length;
+    } else {
+      avgBranch = 1;      // needing repositioning means the order is fully forced
+    }
+
+    var exitableAtStart = sol.exitableAtStart;
+    var blockedAtStart = ctx.N - exitableAtStart;
+    var orderCount = opts.skipOrderCount ? 1
+      : (sol.mode === 'reposition' ? 1 : Math.max(1, sol.orderCount || 1));
+    var maneuverDepth = sol.repositions || 0;
+    var solutionLength = sol.steps;
+
+    var sFree     = clamp((0.45 - freeRatio) / 0.40, 0, 1) * DIFF_WEIGHTS.free;
+    var sBranch   = clamp((5 - avgBranch) / 4, 0, 1) * DIFF_WEIGHTS.branch;
+    var sBlocked  = clamp(blockedAtStart / Math.max(1, ctx.N - 1), 0, 1) * DIFF_WEIGHTS.blocked;
+    var obsScore  = rocks + crates * 1.15 + gates * 2.4 + iceTotal * 1.9;
+    var sObs      = clamp(obsScore / 20, 0, 1) * DIFF_WEIGHTS.obstacles;
+    var sCount    = clamp((ctx.N - 3) / 10, 0, 1) * DIFF_WEIGHTS.count;
+    var sManeuver = clamp(maneuverDepth / 3, 0, 1) * DIFF_WEIGHTS.maneuver;
+    var rigidCap = Math.max(2, opts.orderCap || 24);
+    var sRigid    = clamp(1 - Math.log(Math.max(1, orderCount)) / Math.log(rigidCap), 0, 1) * DIFF_WEIGHTS.rigidity;
+    var score = Math.round(sFree + sBranch + sBlocked + sObs + sCount + sManeuver + sRigid);
+
+    return {
+      solvable: true, score: score, label: difficultyLabel(score),
+      freeRatio: freeRatio, freeCells: freeCells, playable: playable,
+      creatures: ctx.N, avgBranch: avgBranch,
+      blockedAtStart: blockedAtStart, exitableAtStart: exitableAtStart,
+      maneuverDepth: maneuverDepth, solutionLength: solutionLength,
+      orderCount: orderCount, mode: sol.mode,
+      obstacles: { rocks: rocks, crates: crates, gates: gates, ice: iceCount, iceTotal: iceTotal },
+      parts: { free: sFree, branch: sBranch, blocked: sBlocked, obstacles: sObs,
+               count: sCount, maneuver: sManeuver, rigidity: sRigid }
+    };
+  }
+
+  function difficultyLabel(score) {
+    if (score < 35) return 'EASY';
+    if (score < 60) return 'MEDIUM';
+    if (score < 80) return 'HARD';
+    return 'VERY HARD';
+  }
+
+  // =====================================================================
+  // LIVE-STATE HELPERS (hint / bot)
+  // =====================================================================
+
+  function liveBlockedFor(game, id) {
+    var n = game.cols * game.rows;
+    var cr = game.creatures[id];
+    var blocked = new Uint8Array(n);
+    for (var i = 0; i < n; i++) {
+      blocked[i] = (game.blockedStatic[i] || (game.gate[i] && game.gate[i] - 1 !== cr.color)) ? 1 : 0;
+    }
+    for (var j = 0; j < game.creatures.length; j++) {
+      var o = game.creatures[j];
+      if (o.id === id || o.exited) continue;
+      for (var q = 0; q < o.cells.length; q++) blocked[o.cells[q]] = 1;
+    }
+    return blocked;
+  }
+
+  function findExitPath(game, id, nodeCap) {
+    var cr = game.creatures[id];
+    if (!cr || cr.exited || cr.ice > 0) return null;
+    var goals = [];
+    for (var h = 0; h < game.holes.length; h++) {
+      if (game.holes[h].color !== cr.color) continue;
+      for (var m = 0; m < game.holes[h].mouths.length; m++) goals.push(game.holes[h].mouths[m]);
+    }
+    var res = snakeSearch(game.cols, game.rows, liveBlockedFor(game, id), cr.cells, goals, nodeCap || 120000);
+    return res.found ? { id: id, path: res.path } : null;
+  }
+
+  function findHint(game, nodeCap) {
+    var best = null;
+    for (var i = 0; i < game.creatures.length; i++) {
+      if (game.creatures[i].exited) continue;
+      var p = findExitPath(game, i, nodeCap);
+      if (p && (!best || p.path.length < best.path.length)) best = p;
+    }
+    return best;
+  }
+
+  function holeDirFromHead(game, id) {
+    var cr = game.creatures[id];
+    if (!cr || !cr.cells.length) return -1;
+    var head = cr.cells[0];
+    var hc = game.colOf(head), hr = game.rowOf(head);
+    for (var d = 0; d < 4; d++) {
+      var nc = hc + DIRS[d].dc, nr = hr + DIRS[d].dr;
+      if (!game.inBounds(nc, nr)) continue;
+      var hid = game.holeAt[game.idx(nc, nr)];
+      if (hid >= 0 && game.holes[hid].color === cr.color) return d;
+    }
+    return -1;
+  }
+
+  // =====================================================================
+  // LEVEL GENERATION
+  // =====================================================================
+
+  var TIER_COUNT = 6;
+
+  function tierOf(level) {
+    var L = Math.max(1, Math.floor(level));
+    if (L <= 4) return 0;
+    if (L <= 12) return 1;
+    if (L <= 25) return 2;
+    if (L <= 50) return 3;
+    if (L <= 100) return 4;
+    return 5;
+  }
+
+  var TIER_SPANS = [[1, 4], [5, 12], [13, 25], [26, 50], [51, 100], [101, 200]];
+  var BAND_MIN   = [[0, 10], [22, 32], [38, 50], [54, 64], [64, 70], [70, 78]];
+  var BAND_MAX   = [[20, 30], [42, 52], [58, 70], [74, 84], [86, 95], [95, 99]];
+
+  /**
+   * The measured-score band a generated level must land in. It ramps
+   * CONTINUOUSLY inside each tier, so level 50 is required to be harder than
+   * level 30 even though both sit in tier 3.
+   */
+  function difficultyBand(level) {
+    var t = tierOf(level);
+    var span = TIER_SPANS[t];
+    var p = clamp((Math.max(1, Math.floor(level)) - span[0]) / Math.max(1, span[1] - span[0]), 0, 1);
+    return {
+      min: Math.round(BAND_MIN[t][0] + (BAND_MIN[t][1] - BAND_MIN[t][0]) * p),
+      max: Math.round(BAND_MAX[t][0] + (BAND_MAX[t][1] - BAND_MAX[t][0]) * p)
+    };
+  }
+
+  function levelConfig(level) {
+    var L = Math.max(1, Math.floor(level));
+    var tier = tierOf(L);
+    var span = TIER_SPANS[tier];
+    var p = clamp((L - span[0]) / Math.max(1, span[1] - span[0]), 0, 1);
+
+    var PLAY   = [[6, 7], [6, 9], [7, 10], [8, 11], [9, 12], [9, 13]][tier];
+    var FREE   = [[0.46, 0.40], [0.34, 0.26], [0.23, 0.16], [0.15, 0.11], [0.10, 0.075], [0.075, 0.06]][tier];
+    var CREAT  = [[3, 4], [5, 6], [6, 8], [8, 11], [11, 13], [13, 13]][tier];
+    // longer bodies are the main lever for packing density at high tiers
+    var LEN    = [[3, 4], [3, 6], [3, 7], [4, 7], [4, 8], [4, 8]][tier];
+    var ROCKS  = [[0, 0], [1, 3], [2, 5], [4, 7], [5, 9], [9, 12]][tier];
+    var CRATES = [[0, 0], [0, 1], [1, 3], [2, 5], [3, 7], [7, 9]][tier];
+    // extra rocks the densification pass may drop into unused pockets
+    var FILLR  = [[0, 0], [0, 1], [1, 3], [2, 5], [3, 7], [7, 9]][tier];
+    var ICE    = [[0, 0], [0, 1], [1, 3], [2, 4], [3, 5], [5, 6]][tier];
+    var GATES  = [[0, 0], [0, 0], [0, 2], [1, 3], [2, 4], [4, 5]][tier];
+    var REPOS  = [[0, 0], [0, 1], [1, 2], [2, 3], [2, 4], [4, 4]][tier];
+    var IRREG  = [0.03, 0.07, 0.09, 0.10, 0.11, 0.12][tier];
+    var REGFILL= [0.93, 0.92, 0.90, 0.88, 0.87, 0.86];
+
+    function lerpI(pair) { return Math.round(pair[0] + (pair[1] - pair[0]) * p); }
+
+    var creatureCount = lerpI(CREAT);
+    return {
+      level: L, tier: tier, p: p,
+      cols: PLAY[0] + 2, rows: PLAY[1] + 2,
+      playCols: PLAY[0], playRows: PLAY[1],
+      regionFill: REGFILL[tier],
+      irregularity: IRREG,
+      targetFree: FREE[0] + (FREE[1] - FREE[0]) * p,
+      creatureCount: creatureCount,
+      // the tutorial tier is capped hard; later tiers may pack in extras until
+      // the free-space target is met
+      maxCreatures: tier === 0 ? creatureCount + 2 : 13,
+      minLen: LEN[0], maxLen: LEN[1],
+      rocks: lerpI(ROCKS), crates: lerpI(CRATES), fillRocks: lerpI(FILLR),
+      iceCreatures: lerpI(ICE), gates: lerpI(GATES),
+      repositionEpisodes: lerpI(REPOS),
+      minK: tier === 0 ? 2 : 3,
+      maxK: 4 + Math.round(p * 5) + tier,
+      band: difficultyBand(L),
+      seed: (L * 2654435761) >>> 0
+    };
+  }
+
+  function neighborsOf(i, cols, rows) {
+    var c = i % cols, r = (i - c) / cols;
+    var out = [];
+    for (var d = 0; d < 4; d++) {
+      var nc = c + DIRS[d].dc, nr = r + DIRS[d].dr;
+      if (nc < 0 || nr < 0 || nc >= cols || nr >= rows) continue;
+      out.push(nc + nr * cols);
+    }
+    return out;
+  }
+  function countRegionNeighbors(i, reg, cols, rows) {
+    var ns = neighborsOf(i, cols, rows), k = 0;
+    for (var q = 0; q < ns.length; q++) if (reg[ns[q]]) k++;
+    return k;
+  }
+  function connectedCount(free, cols, rows, startIdx) {
+    var seen = new Uint8Array(free.length);
+    var q = [startIdx], qh = 0, k = 0;
+    seen[startIdx] = 1;
+    while (qh < q.length) {
+      var cur = q[qh++]; k++;
+      var ns = neighborsOf(cur, cols, rows);
+      for (var i = 0; i < ns.length; i++) {
+        if (!free[ns[i]] || seen[ns[i]]) continue;
+        seen[ns[i]] = 1; q.push(ns[i]);
+      }
+    }
+    return k;
+  }
+  function isConnected(mask, cols, rows) {
+    var first = -1, total = 0;
+    for (var i = 0; i < mask.length; i++) if (mask[i]) { if (first < 0) first = i; total++; }
+    if (first < 0) return true;
+    return connectedCount(mask, cols, rows, first) === total;
+  }
+
+  /**
+   * Irregular jigsaw playable region: a compact blob, bitten into around the
+   * perimeter to make notches, alcoves and one-cell corridors.
+   */
+  function growRegion(rng, cfg) {
+    var cols = cfg.cols, rows = cfg.rows;
+    var reg = new Uint8Array(cols * rows);
+    var x0 = 1, y0 = 1, w = cfg.playCols, h = cfg.playRows;
+    function inWin(i) {
+      var c = i % cols, r = (i - c) / cols;
+      return c >= x0 && r >= y0 && c < x0 + w && r < y0 + h;
+    }
+    var target = Math.round(w * h * cfg.regionFill);
+    var seed = (x0 + (w >> 1)) + (y0 + (h >> 1)) * cols;
+    reg[seed] = 1;
+    var count = 1;
+
+    while (count < target) {
+      var cands = Object.create(null);
+      for (var i = 0; i < reg.length; i++) {
+        if (!reg[i]) continue;
+        var ns = neighborsOf(i, cols, rows);
+        for (var q = 0; q < ns.length; q++) {
+          var ni = ns[q];
+          if (reg[ni] || !inWin(ni)) continue;
+          cands[ni] = (cands[ni] || 0) + 1;
+        }
+      }
+      var keys = Object.keys(cands);
+      if (!keys.length) break;
+      var total = 0, weights = [];
+      for (var k = 0; k < keys.length; k++) {
+        var wgt = Math.pow(cands[keys[k]], 3) + 0.35;
+        weights.push(wgt); total += wgt;
+      }
+      var pick = rng() * total, acc = 0, chosen = keys[keys.length - 1];
+      for (var k2 = 0; k2 < keys.length; k2++) {
+        acc += weights[k2];
+        if (pick <= acc) { chosen = keys[k2]; break; }
+      }
+      reg[chosen | 0] = 1;
+      count++;
+    }
+
+    for (var pass = 0; pass < 2; pass++) {
+      for (var a = 0; a < reg.length; a++) {
+        if (reg[a] || !inWin(a)) continue;
+        if (countRegionNeighbors(a, reg, cols, rows) >= 3) { reg[a] = 1; count++; }
+      }
+    }
+
+    // carve jigsaw bites out of the perimeter -> alcoves and narrow corridors
+    var bites = Math.round(count * cfg.irregularity);
+    var guard = 0;
+    while (bites > 0 && guard++ < 400) {
+      var edge = [];
+      for (var e = 0; e < reg.length; e++) {
+        if (!reg[e]) continue;
+        if (countRegionNeighbors(e, reg, cols, rows) < 4) edge.push(e);
+      }
+      if (!edge.length) break;
+      var cell = edge[Math.floor(rng() * edge.length)];
+      reg[cell] = 0;
+      if (!isConnected(reg, cols, rows)) { reg[cell] = 1; continue; }
+      count--; bites--;
+    }
+
+    // shave dead-end nubs (removing a leaf can never disconnect the rest)
+    for (var pass2 = 0; pass2 < 2; pass2++) {
+      for (var b2 = 0; b2 < reg.length; b2++) {
+        if (!reg[b2]) continue;
+        if (countRegionNeighbors(b2, reg, cols, rows) <= 1) { reg[b2] = 0; count--; }
+      }
+    }
+    return { reg: reg, count: count };
+  }
+
+  /** Rocks that PINCH the board (interior first) rather than scatter. */
+  function placeRocks(rng, cfg, reg, wantRocks) {
+    var cols = cfg.cols, rows = cfg.rows;
+    var wall = new Uint8Array(cols * rows);
+    var free = Uint8Array.from(reg);
+    var cands = [];
+    for (var i = 0; i < reg.length; i++) if (reg[i]) cands.push(i);
+    shuffleInPlace(cands, rng);
+    cands.sort(function (a, b) {
+      return countRegionNeighbors(b, reg, cols, rows) - countRegionNeighbors(a, reg, cols, rows);
+    });
+    var placed = 0;
+    for (var k = 0; k < cands.length && placed < wantRocks; k++) {
+      var idx = Math.min(cands.length - 1, k + Math.floor(rng() * 3));
+      var cell = cands[idx];
+      if (wall[cell]) continue;
+      free[cell] = 0;
+      if (!isConnected(free, cols, rows)) { free[cell] = 1; continue; }
+      wall[cell] = 1; placed++;
+    }
+    return { wall: wall, placed: placed };
+  }
+
+  // ------------------------------------------------------ backward timeline
+  //
+  // The WHOLE solution is simulated backwards from "every creature already
+  // exited". Two reversible actions:
+  //
+  //   reverse-feed X : X grows one cell out of its hole   (forward: X feeds in)
+  //   reverse-move X : X's head cell is released and a new tail cell claimed
+  //                    (forward: X's head steps into the released cell)
+  //
+  // Every backward step only claims cells that are free at that moment, so
+  // replaying the reversed action list forwards is legal move-for-move.
+  //
+  // Interleaving a reverse-move of an EARLIER-materialised creature after a
+  // later one exists yields a forward REPOSITIONING move: that creature must
+  // shuffle out of the way before the other one can leave. This is what
+  // produces genuine maneuver depth.
+
+  function Timeline(cfg, blocked) {
+    this.cfg = cfg;
+    this.cols = cfg.cols; this.rows = cfg.rows;
+    this.blocked = blocked;
+    this.occ = new Int16Array(cfg.cols * cfg.rows);
+    for (var i = 0; i < this.occ.length; i++) this.occ[i] = -1;
+    this.bodies = [];
+    this.actions = [];                        // backward order
+    this.touched = Object.create(null);
+    this.traversedBy = Object.create(null);
+  }
+  Timeline.prototype.isFree = function (cell) {
+    return !this.blocked[cell] && this.occ[cell] < 0;
+  };
+  Timeline.prototype._mark = function (cell, color) {
+    this.touched[cell] = 1;
+    if (!this.traversedBy[cell]) this.traversedBy[cell] = {};
+    this.traversedBy[cell][color] = 1;
+  };
+  Timeline.prototype.freeNeighbors = function (cell) {
+    var out = [], ns = neighborsOf(cell, this.cols, this.rows);
+    for (var i = 0; i < ns.length; i++) if (this.isFree(ns[i])) out.push(ns[i]);
+    return out;
+  };
+  Timeline.prototype.materialise = function (rng, id, color, mouth, len) {
+    if (!this.isFree(mouth)) return false;
+    var self = this;
+    var body = [mouth];
+    this.occ[mouth] = id;
+    for (var s = 1; s < len; s++) {
+      var cands = this.freeNeighbors(body[body.length - 1]);
+      if (!cands.length) {
+        for (var q = 0; q < body.length; q++) this.occ[body[q]] = -1;
+        return false;
+      }
+      shuffleInPlace(cands, rng);
+      cands.sort(function (a, b) { return self.freeNeighbors(b).length - self.freeNeighbors(a).length; });
+      var next = cands[Math.floor(rng() * Math.min(2, cands.length))];
+      body.push(next);
+      this.occ[next] = id;
+    }
+    for (var m = 0; m < body.length; m++) this._mark(body[m], color);
+    this.bodies[id] = body;
+    this.actions.push({ kind: 'feed', id: id, count: len, mouth: mouth });
+    return true;
+  };
+  Timeline.prototype.reverseMove = function (rng, id, color) {
+    var body = this.bodies[id];
+    if (!body || body.length < 2) return false;
+    var headCell = body[0];
+    var cands = this.freeNeighbors(body[body.length - 1]);   // headCell still occupied -> excluded
+    if (!cands.length) return false;
+    var self = this;
+    shuffleInPlace(cands, rng);
+    cands.sort(function (a, b) { return self.freeNeighbors(b).length - self.freeNeighbors(a).length; });
+    var t = cands[Math.floor(rng() * Math.min(2, cands.length))];
+    this.occ[headCell] = -1;
+    body.shift();
+    body.push(t);
+    this.occ[t] = id;
+    this._mark(t, color);
+    this.actions.push({ kind: 'move', id: id, target: headCell });
+    return true;
+  };
+  Timeline.prototype.forwardPlan = function () {
+    var fwd = [];
+    for (var i = this.actions.length - 1; i >= 0; i--) fwd.push(this.actions[i]);
+    return fwd;
+  };
+  /** Exits completed before each creature's FIRST forward action = safe ice cap. */
+  Timeline.prototype.iceBudget = function (ids) {
+    var fwd = this.forwardPlan();
+    var exited = 0;
+    var budget = {};
+    ids.forEach(function (id) { budget[id] = -1; });
+    for (var i = 0; i < fwd.length; i++) {
+      var a = fwd[i];
+      if (budget[a.id] !== undefined && budget[a.id] < 0) budget[a.id] = exited;
+      if (a.kind === 'feed') exited++;
+    }
+    ids.forEach(function (id) { if (budget[id] < 0) budget[id] = 0; });
+    return budget;
+  };
+  Timeline.prototype.undoCreature = function (id) {
+    var body = this.bodies[id];
+    if (!body) return;
+    for (var i = 0; i < body.length; i++) this.occ[body[i]] = -1;
+    this.bodies[id] = null;
+    while (this.actions.length && this.actions[this.actions.length - 1].id === id) this.actions.pop();
+  };
+
+  function tryGenerate(cfg, rng) {
+    var cols = cfg.cols, rows = cfg.rows, n = cols * rows;
+
+    // ---- 1. irregular board
+    var grown = growRegion(rng, cfg);
+    var reg = grown.reg;
+    if (grown.count < cfg.creatureCount * cfg.minLen + 6) return null;
+    if (!isConnected(reg, cols, rows)) return null;
+
+    // ---- 2. rocks pinch corridors
+    var rockRes = placeRocks(rng, cfg, reg, cfg.rocks);
+    var wall = rockRes.wall;
+
+    var blocked = new Uint8Array(n);
+    var playableCells = 0;
+    for (var b = 0; b < n; b++) {
+      blocked[b] = (!reg[b] || wall[b]) ? 1 : 0;
+      if (reg[b] && !wall[b]) playableCells++;
+    }
+
+    // ---- 3. border holes
+    var holeCands = [];
+    for (var hcI = 0; hcI < n; hcI++) {
+      if (reg[hcI]) continue;
+      var mouths = neighborsOf(hcI, cols, rows).filter(function (x) { return reg[x] && !wall[x]; });
+      if (!mouths.length) continue;
+      holeCands.push({ index: hcI, c: hcI % cols, r: (hcI - (hcI % cols)) / cols, mouths: mouths });
+    }
+    if (holeCands.length < cfg.creatureCount) return null;
+
+    // ---- 4. backward timeline (also drives packing density)
+    var tl = new Timeline(cfg, blocked);
+    var holes = [], creatures = [];
+    var usedHole = Object.create(null);
+    var occupiedCells = 0, placed = 0, repositionsMade = 0;
+    var targetOccupied = playableCells * (1 - cfg.targetFree);
+    var FLOOR_LEN = 3;   // absolute shortest body the packer may fall back to
+
+    for (var ci = 0; ci < cfg.maxCreatures; ci++) {
+      if (placed >= cfg.creatureCount &&
+          (playableCells - occupiedCells) / playableCells <= cfg.targetFree) break;
+
+      var color = ci % COLOR_COUNT;
+      var freeFrac = (playableCells - occupiedCells) / playableCells;
+      // Body length is chosen so that `creatureCount` bodies land exactly on the
+      // packing target - drawing from [minLen,maxLen] instead makes the first
+      // few creatures eat the whole board and starves the rest.
+      var avgLen = clamp(targetOccupied / Math.max(1, cfg.creatureCount), cfg.minLen, cfg.maxLen);
+      // Monotonically decreasing schedule: long bodies first (while they still
+      // fit), short ones last. The sum still lands on the packing target, but
+      // far more of the requested length actually gets placed.
+      var frac = placed / Math.max(1, cfg.creatureCount);
+      var len = clamp(Math.round(avgLen * (1.35 - 0.75 * clamp(frac, 0, 1)) + (rng() - 0.5)),
+                      FLOOR_LEN, cfg.maxLen);
+      var kHi = freeFrac > 0.35 ? cfg.maxK : freeFrac > 0.22 ? Math.max(cfg.minK, cfg.maxK - 3) : cfg.minK;
+      var wantK = cfg.minK + Math.floor(rng() * Math.max(1, kHi - cfg.minK + 1));
+      var minMoved = (cfg.tier === 0) ? 2 : (freeFrac > 0.35 ? 3 : freeFrac > 0.20 ? 2 : 1);
+      var cands = shuffleInPlace(holeCands.slice(), rng);
+      var done = false;
+
+      for (var a2 = 0; a2 < cands.length && !done; a2++) {
+        var hc = cands[a2];
+        if (usedHole[hc.index]) continue;
+        var liveMouths = shuffleInPlace(hc.mouths.filter(function (m) { return tl.isFree(m); }), rng);
+        for (var mi = 0; mi < liveMouths.length && !done; mi++) {
+          for (var tryLen = len; tryLen >= FLOOR_LEN && !done; tryLen--) {
+            if (!tl.materialise(rng, ci, color, liveMouths[mi], tryLen)) continue;
+            var moved = 0;
+            for (var k2 = 0; k2 < wantK; k2++) {
+              if (!tl.reverseMove(rng, ci, color)) break;
+              moved++;
+            }
+            if (moved < minMoved) { tl.undoCreature(ci); continue; }
+            usedHole[hc.index] = 1;
+            holes.push({
+              id: holes.length, color: color, c: hc.c, r: hc.r, index: hc.index,
+              mouths: hc.mouths.slice(),
+              facing: facingOf(hc.c, hc.r, liveMouths[mi], cols)
+            });
+            creatures.push({ id: ci, color: color, holeId: holes.length - 1 });
+            occupiedCells += tryLen;
+            placed++;
+            done = true;
+          }
+        }
+      }
+      // could not fit another one: retry a couple of times with the smallest
+      // possible body before conceding, then stop packing (never discard the
+      // board - the difficulty measurement decides whether to keep it)
+      if (!done) {
+        var rescued = false;
+        for (var rt = 0; rt < 3 && !rescued; rt++) {
+          var rcands = shuffleInPlace(holeCands.slice(), rng);
+          for (var rc = 0; rc < rcands.length && !rescued; rc++) {
+            if (usedHole[rcands[rc].index]) continue;
+            var rm = shuffleInPlace(rcands[rc].mouths.filter(function (m) { return tl.isFree(m); }), rng);
+            for (var rmi = 0; rmi < rm.length && !rescued; rmi++) {
+              if (!tl.materialise(rng, ci, color, rm[rmi], FLOOR_LEN)) continue;
+              if (!tl.reverseMove(rng, ci, color)) { tl.undoCreature(ci); continue; }
+              usedHole[rcands[rc].index] = 1;
+              holes.push({
+                id: holes.length, color: color, c: rcands[rc].c, r: rcands[rc].r,
+                index: rcands[rc].index, mouths: rcands[rc].mouths.slice(),
+                facing: facingOf(rcands[rc].c, rcands[rc].r, rm[rmi], cols)
+              });
+              creatures.push({ id: ci, color: color, holeId: holes.length - 1 });
+              occupiedCells += FLOOR_LEN;
+              placed++;
+              rescued = true;
+            }
+          }
+        }
+        if (!rescued) break;
+      }
+
+      // ---- 5. repositioning episode: shuffle an EARLIER creature now that a
+      //         later one exists -> forward, it must move aside first.
+      if (repositionsMade < cfg.repositionEpisodes && placed >= 2 && rng() < 0.7) {
+        var vi = Math.floor(rng() * (placed - 1));
+        var did = 0, steps = 2 + Math.floor(rng() * 3);
+        for (var s2 = 0; s2 < steps; s2++) {
+          if (!tl.reverseMove(rng, creatures[vi].id, creatures[vi].color)) break;
+          did++;
+        }
+        if (did >= 2) repositionsMade++;
+      }
+    }
+
+    if (placed < Math.max(3, Math.ceil(cfg.creatureCount * 0.7))) return null;
+    creatures.forEach(function (c) { c.cells = tl.bodies[c.id].slice(); });
+
+    // ---- 6. densification: crates/rocks fill pockets the solution NEVER uses,
+    //         so the construction proof still holds.
+    var crate = new Uint8Array(n);
+    var gate = new Uint8Array(n);
+    var untouched = [];
+    for (var u = 0; u < n; u++) {
+      if (!reg[u] || wall[u]) continue;
+      if (tl.occ[u] >= 0 || tl.touched[u]) continue;
+      untouched.push(u);
+    }
+    shuffleInPlace(untouched, rng);
+
+    var occNow = 0;
+    creatures.forEach(function (c) { occNow += c.cells.length; });
+    // solve (playable - fill - occNow) / (playable - fill) = targetFree
+    var fillExact = Math.round((playableCells - occNow - cfg.targetFree * playableCells) /
+                               Math.max(0.0001, 1 - cfg.targetFree));
+    var fillBudget = cfg.crates + cfg.fillRocks;
+    var fill = clamp(fillExact, 0, Math.min(untouched.length, fillBudget));
+    var crateBudget = Math.min(cfg.crates, fill);
+    for (var uu = 0; uu < fill; uu++) {
+      if (uu < crateBudget) crate[untouched[uu]] = (uu % COLOR_COUNT) + 1;
+      else wall[untouched[uu]] = 1;
+    }
+    var obstaclesPlaced = fill;
+
+    // ---- 6b. SPECULATIVE DENSIFICATION.
+    // Filling only never-visited pockets rarely reaches the packing target,
+    // because the backward timeline touches most of the board. So keep going
+    // into cells the solution DOES use, and verify after each batch: a batch
+    // that breaks solvability is rolled straight back out. This is what gets
+    // the high tiers from ~15% free down to ~8-10%.
+    // The tutorial tier is contractually obstacle-free, and no tier may exceed
+    // its obstacle allowance just because the packer left gaps.
+    var extraCap = cfg.tier === 0 ? 0 : (cfg.crates + cfg.fillRocks + 8);
+    var stillShort = Math.min(fillExact - fill, Math.max(0, extraCap - fill));
+    if (stillShort > 0) {
+      var risky = [];
+      for (var rv = 0; rv < n; rv++) {
+        if (!reg[rv] || wall[rv] || crate[rv]) continue;
+        if (tl.occ[rv] >= 0) continue;              // a body sits there
+        risky.push(rv);
+      }
+      shuffleInPlace(risky, rng);
+      var probe = { level: cfg.level, cols: cols, rows: rows,
+                    region: Array.prototype.slice.call(reg),
+                    wall: null, crate: null, gate: Array.prototype.slice.call(gate),
+                    holes: holes, creatures: null };
+      var applied = 0;
+      for (var round = 0; round < 5 && applied < stillShort && risky.length; round++) {
+        var batch = Math.max(1, Math.ceil((stillShort - applied) / (round === 0 ? 1 : 3)));
+        batch = Math.min(batch, risky.length);
+        var taken = risky.slice(0, batch);
+        var trialWall = Uint8Array.from(wall), trialCrate = Uint8Array.from(crate);
+        for (var tk = 0; tk < taken.length; tk++) {
+          if ((obstaclesPlaced + applied + tk) % 3 === 0 && (obstaclesPlaced + applied + tk) < cfg.crates + cfg.fillRocks + 8) {
+            trialCrate[taken[tk]] = ((tk + 3) % COLOR_COUNT) + 1;
+          } else {
+            trialWall[taken[tk]] = 1;
+          }
+        }
+        probe.wall = Array.prototype.slice.call(trialWall);
+        probe.crate = Array.prototype.slice.call(trialCrate);
+        probe.creatures = creatures.map(function (c, i) {
+          return { id: i, color: c.color, holeId: c.holeId, cells: c.cells.slice(), ice: 0 };
+        });
+        // holes must still touch the board
+        var mouthsOk = true;
+        for (var hm = 0; hm < holes.length; hm++) {
+          var live = holes[hm].mouths.filter(function (m) { return !trialWall[m] && !trialCrate[m]; });
+          if (!live.length) { mouthsOk = false; break; }
+        }
+        var ok = false;
+        if (mouthsOk) {
+          try {
+            var probeLevel = {
+              level: cfg.level, tier: cfg.tier, cols: cols, rows: rows,
+              region: probe.region, wall: probe.wall, crate: probe.crate, gate: probe.gate,
+              holes: holes.map(function (h) {
+                return { id: h.id, color: h.color, c: h.c, r: h.r, index: h.index,
+                         mouths: h.mouths.filter(function (m) { return !trialWall[m] && !trialCrate[m]; }),
+                         facing: h.facing };
+              }),
+              creatures: probe.creatures
+            };
+            var chk = solveLevel(probeLevel, { nodeCap: 90000, fastOnly: true });
+            ok = chk.solvable;
+          } catch (e) { ok = false; }
+        }
+        if (ok) {
+          wall = trialWall; crate = trialCrate;
+          applied += taken.length;
+          risky = risky.slice(batch);
+        } else {
+          risky = risky.slice(batch);      // this batch is poison, try another
+        }
+      }
+      // keep the hole mouth lists consistent with the final obstacle field
+      for (var hf = 0; hf < holes.length; hf++) {
+        holes[hf].mouths = holes[hf].mouths.filter(function (m) { return !wall[m] && !crate[m]; });
+      }
+    }
+
+    // ---- 7. gates on cells only ever traversed by ONE colour
+    var gateCands = [];
+    for (var gk in tl.traversedBy) {
+      var cell = gk | 0;
+      if (wall[cell] || crate[cell]) continue;
+      var colorsHere = Object.keys(tl.traversedBy[gk]);
+      if (colorsHere.length !== 1) continue;
+      gateCands.push({ cell: cell, color: colorsHere[0] | 0 });
+    }
+    shuffleInPlace(gateCands, rng);
+    var gatesPlaced = 0;
+    for (var g2 = 0; g2 < gateCands.length && gatesPlaced < cfg.gates; g2++) {
+      var gc = gateCands[g2];
+      var isMouth = false;
+      for (var hh = 0; hh < holes.length; hh++) {
+        if (holes[hh].mouths.indexOf(gc.cell) >= 0) { isMouth = true; break; }
+      }
+      if (isMouth) continue;
+      gate[gc.cell] = gc.color + 1;
+      gatesPlaced++;
+    }
+
+    // ---- 8. ice on creatures that genuinely act late in the solution
+    var budgets = tl.iceBudget(creatures.map(function (c) { return c.id; }));
+    var iceOrder = creatures.map(function (c, i) { return { i: i, budget: budgets[c.id] || 0 }; })
+      .filter(function (o) { return o.budget >= 1; })
+      .sort(function (x, y) { return y.budget - x.budget; });
+    for (var ic = 0; ic < iceOrder.length && ic < cfg.iceCreatures; ic++) {
+      creatures[iceOrder[ic].i].ice = Math.min(4, iceOrder[ic].budget);
+    }
+
+    // ---- 9. assemble (renumber creatures 0..N-1 in placement order)
+    var level = {
+      level: cfg.level, tier: cfg.tier,
+      cols: cols, rows: rows,
+      region: Array.prototype.slice.call(reg),
+      wall: Array.prototype.slice.call(wall),
+      crate: Array.prototype.slice.call(crate),
+      gate: Array.prototype.slice.call(gate),
+      holes: holes,
+      creatures: [],
+      timeLimit: 120, parMoves: 0, seed: cfg.seed,
+      buildOrder: null
+    };
+    var remap = {};
+    creatures.forEach(function (c, i) {
+      remap[c.id] = i;
+      level.creatures.push({ id: i, color: c.color, holeId: c.holeId, cells: c.cells.slice(), ice: c.ice || 0 });
+    });
+    level.buildOrder = {
+      forward: tl.forwardPlan().map(function (act) {
+        return { kind: act.kind, id: remap[act.id], count: act.count, target: act.target };
+      }),
+      repositions: repositionsMade
+    };
+
+    try { new Game(level); } catch (e) { return null; }
+    return level;
+  }
+
+  /**
+   * Deterministic per-level generation with GENERATE-MEASURE-REJECT: candidates
+   * whose MEASURED difficulty falls outside the band for this level number are
+   * discarded; the closest near-miss is kept only as a last resort.
+   */
+  function generateLevel(levelNumber, opts) {
+    opts = opts || {};
+    var cfg = levelConfig(levelNumber);
+    var band = cfg.band;
+    var maxAttempts = opts.maxAttempts || 34;
+    var salt = ((opts.variant || 0) * 0x85EBCA6B) >>> 0;
+    var best = null, bestDist = Infinity, inBand = null;
+    var deadline = Date.now() + (opts.timeBudgetMs || 900);
+    var analyzeOpts = {
+      nodeCap: opts.nodeCap || 250000,
+      orderCap: opts.orderCap || 24,
+      repositionBudget: cfg.repositionEpisodes > 0 ? 2 : 1,
+      timeBudgetMs: 900
+    };
+
+    var work = cfg;
+    for (var a = 0; a < maxAttempts; a++) {
+      // relaxation ladder: if nothing at all fits, ask for a little less
+      if (a > 0 && a % 8 === 0 && !best) {
+        work = Object.assign({}, work, {
+          creatureCount: Math.max(3, work.creatureCount - 1),
+          targetFree: Math.min(0.5, work.targetFree + 0.03),
+          maxK: Math.max(3, work.maxK - 1)
+        });
+      }
+      // never stall the UI: once the wall-clock budget is spent, ship the best
+      // candidate found so far (it is always solvable - it was measured)
+      if ((best || inBand) && Date.now() > deadline) break;
+      var rng = makeRng((cfg.seed + salt + a * 0x9E3779B1) >>> 0);
+      var lvl = null;
+      try { lvl = tryGenerate(work, rng); } catch (e) { lvl = null; }
+      if (!lvl) continue;
+
+      // Cheap static gate before paying for a full solve: most rejects are
+      // simply not packed tightly enough.
+      if (a < maxAttempts - 6) {
+        var pn = lvl.cols * lvl.rows, pPlay = 0, pOcc = 0;
+        for (var pi = 0; pi < pn; pi++) {
+          if (lvl.region[pi] && !lvl.wall[pi] && !lvl.crate[pi]) pPlay++;
+        }
+        lvl.creatures.forEach(function (c) { pOcc += c.cells.length; });
+        var pFree = pPlay > 0 ? (pPlay - pOcc) / pPlay : 1;
+        if (pFree > work.targetFree + (work.tier >= 3 ? 0.07 : 0.13)) continue;
+        if (lvl.creatures.length < Math.max(3, work.creatureCount - 2)) continue;
+      }
+
+      var diff;
+      try { diff = analyzeLevel(lvl, analyzeOpts); } catch (e) { continue; }
+      if (!diff.solvable) continue;
+
+      lvl.difficulty = diff;
+      lvl.parMoves = diff.solutionLength;
+      lvl.timeLimit = Math.round(clamp(55 + diff.solutionLength * 1.7, 90, 300));
+      lvl.attempts = a + 1;
+
+      if (diff.score >= band.min && diff.score <= band.max) {
+        var rich = diff.maneuverDepth > 0 || diff.orderCount <= 6;
+        if (rich || work.tier < 3 || inBand) return lvl;
+        // in band but shallow: remember it and spend a few more attempts
+        // looking for one that genuinely forces an ordering
+        inBand = lvl;
+        continue;
+      }
+      var dist = diff.score < band.min ? band.min - diff.score : diff.score - band.max;
+      if (dist < bestDist) { bestDist = dist; best = lvl; }
+    }
+    if (inBand) return inBand;
+    if (best) return best;
+    // last resort: a guaranteed-simple board so the game can never dead-end
+    var fallback = levelConfig(Math.min(4, levelNumber));
+    fallback.level = levelNumber;
+    fallback.seed = cfg.seed;
+    for (var f = 0; f < 60; f++) {
+      var lv2 = null;
+      try { lv2 = tryGenerate(fallback, makeRng((cfg.seed + salt + f * 0x7F4A7C15) >>> 0)); } catch (e) { lv2 = null; }
+      if (!lv2) continue;
+      var d2 = analyzeLevel(lv2, { nodeCap: 250000, skipOrderCount: true, repositionBudget: 1 });
+      if (!d2.solvable) continue;
+      lv2.difficulty = d2;
+      lv2.parMoves = d2.solutionLength;
+      lv2.timeLimit = Math.round(clamp(55 + d2.solutionLength * 1.7, 90, 300));
+      lv2.attempts = maxAttempts + f + 1;
+      lv2.fallback = true;
+      return lv2;
+    }
+    throw new Error('level generation failed for level ' + levelNumber);
+  }
+
+  // ----------------------------------------------------------------- scoring
+
+  /** Stars key off move efficiency against the solver's optimal solution. */
+  function starsFor(timeLeft, timeLimit, moves, parMoves) {
+    var timeFrac = timeLimit > 0 ? clamp(timeLeft / timeLimit, 0, 1) : 0;
+    var moveFrac = parMoves > 0 ? moves / parMoves : 1;
+    if (timeFrac >= 0.35 && moveFrac <= 1.40) return 3;
+    if (timeFrac >= 0.12 && moveFrac <= 2.30) return 2;
+    return 1;
+  }
+  function coinsFor(stars, level, comboBest) {
+    return Math.round((stars * 12 + 6) * (1 + Math.min(0.6, (level - 1) * 0.012)) + (comboBest || 0) * 5);
+  }
+
+  // --------------------------------------------------------------- utilities
+
+  /** Replay a solver result on a fresh Game to prove the plan really works. */
+  function replaySolution(level, solution) {
+    var g = new Game(level);
+    function feedOut(id) {
+      var hd = holeDirFromHead(g, id);
+      if (hd < 0) return 'creature ' + id + ' did not finish on a mouth';
+      var guard = 0;
+      while (!g.creatures[id].exited) {
+        var fr = g.stepHead(id, hd);
+        if (!fr.ok) return 'feed rejected for creature ' + id + ': ' + fr.reason;
+        if (++guard > 64) return 'feed did not terminate for creature ' + id;
+      }
+      return null;
+    }
+    if (solution.actions) {
+      for (var i = 0; i < solution.actions.length; i++) {
+        var act = solution.actions[i];
+        for (var p = 0; p < act.path.length; p++) {
+          var r = g.stepHead(act.id, act.path[p]);
+          if (!r.ok) return { ok: false, reason: act.kind + ' rejected for creature ' + act.id + ' step ' + p + ': ' + r.reason };
+        }
+        if (act.kind === 'exit') {
+          var err = feedOut(act.id);
+          if (err) return { ok: false, reason: err };
+        }
+      }
+    } else if (solution.order) {
+      for (var o = 0; o < solution.order.length; o++) {
+        var id = solution.order[o];
+        var path = solution.plans[id];
+        for (var q = 0; q < path.length; q++) {
+          var r2 = g.stepHead(id, path[q]);
+          if (!r2.ok) return { ok: false, reason: 'move rejected for creature ' + id + ' step ' + q + ': ' + r2.reason };
+        }
+        var err2 = feedOut(id);
+        if (err2) return { ok: false, reason: err2 };
+      }
+    } else {
+      return { ok: false, reason: 'solution has neither actions nor an order' };
+    }
+    return { ok: g.isWon(), reason: g.isWon() ? 'won' : 'not all creatures exited', game: g };
+  }
+
+  /** Replay the GENERATOR's own construction record (diagnostics only). */
+  function replayConstruction(level) {
+    if (!level.buildOrder || !level.buildOrder.forward) return { ok: false, reason: 'no build record' };
+    var g = new Game(level);
+    var fwd = level.buildOrder.forward;
+    for (var i = 0; i < fwd.length; i++) {
+      var a = fwd[i];
+      if (a.kind === 'move') {
+        var head = g.creatures[a.id].cells[0];
+        var dir = -1;
+        for (var d = 0; d < 4; d++) {
+          if (g.colOf(head) + DIRS[d].dc === g.colOf(a.target) &&
+              g.rowOf(head) + DIRS[d].dr === g.rowOf(a.target)) { dir = d; break; }
+        }
+        if (dir < 0) return { ok: false, reason: 'construction move ' + i + ' not adjacent for creature ' + a.id };
+        var r = g.stepHead(a.id, dir);
+        if (!r.ok) return { ok: false, reason: 'construction move ' + i + ' rejected: ' + r.reason };
+      } else {
+        var hd = holeDirFromHead(g, a.id);
+        if (hd < 0) return { ok: false, reason: 'construction feed ' + i + ': creature ' + a.id + ' not on a mouth' };
+        for (var k = 0; k < a.count; k++) {
+          var fr = g.stepHead(a.id, hd);
+          if (!fr.ok) return { ok: false, reason: 'construction feed ' + i + ' rejected: ' + fr.reason };
+        }
+      }
+    }
+    return { ok: g.isWon(), reason: g.isWon() ? 'won' : 'construction did not clear the board', game: g };
+  }
+
+  /** ASCII dump - debugging aid and test failure output. */
+  function render(game) {
+    var out = [];
+    for (var r = 0; r < game.rows; r++) {
+      var line = '';
+      for (var c = 0; c < game.cols; c++) {
+        var i = game.idx(c, r);
+        var hid = game.holeAt[i];
+        if (hid >= 0) { line += String.fromCharCode(48 + game.holes[hid].color); continue; }
+        if (!game.region[i]) { line += ' '; continue; }
+        if (game.wall[i]) { line += '#'; continue; }
+        if (game.crate[i]) { line += 'X'; continue; }
+        var o = game.occ[i];
+        if (o < 0) { line += game.gate[i] ? '=' : '.'; continue; }
+        line += (game.creatures[o].cells[0] === i)
+          ? String.fromCharCode(65 + o) : String.fromCharCode(97 + o);
+      }
+      out.push(line);
+    }
+    return out.join('\n');
+  }
+
+  return {
+    VERSION: VERSION,
+    DIRS: DIRS,
+    DIR_UP: DIR_UP, DIR_RIGHT: DIR_RIGHT, DIR_DOWN: DIR_DOWN, DIR_LEFT: DIR_LEFT,
+    OPPOSITE: OPPOSITE,
+    COLOR_COUNT: COLOR_COUNT,
+    TIER_COUNT: TIER_COUNT,
+    makeRng: makeRng,
+    buildLevel: buildLevel,
+    Game: Game,
+    levelConfig: levelConfig,
+    tierOf: tierOf,
+    difficultyBand: difficultyBand,
+    difficultyLabel: difficultyLabel,
+    generateLevel: generateLevel,
+    analyzeLevel: analyzeLevel,
+    solveLevel: solveLevel,
+    solverContext: solverContext,
+    countExitOrders: countExitOrders,
+    snakeSearch: snakeSearch,
+    reachableConfigs: reachableConfigs,
+    findExitPath: findExitPath,
+    findHint: findHint,
+    holeDirFromHead: holeDirFromHead,
+    replaySolution: replaySolution,
+    replayConstruction: replayConstruction,
+    starsFor: starsFor,
+    coinsFor: coinsFor,
+    render: render
+  };
+});
+
+</script>
+  <script>
+/*
+ * Neon Unravel - game.js
+ *
+ * Canvas presentation + drag input + WebAudio. Consumes window.NeonUnravelCore.
+ *
+ * HARD RULE: every pixel of UI is painted onto the single <canvas>. There is
+ * no DOM element layered above it, so there is nothing that can silently eat a
+ * touch.
+ */
+(function () {
+  'use strict';
+
+  var Core = (typeof window !== 'undefined' && window.NeonUnravelCore) || null;
+  if (!Core) { throw new Error('NeonUnravelCore must load before game.js'); }
+
+  // =====================================================================
+  // Constants & palette  (BRIGHT, high contrast - readable in daylight)
+  // =====================================================================
+
+  var W = 400, H = 640;
+
+  var PAL = {
+    bgTop:      '#eef3fa',
+    bg:         '#dfe6f0',
+    bgDeep:     '#cbd6e6',
+    boardCell:  '#8d9ab0',
+    boardCellAlt: '#8593a9',
+    boardLine:  '#6d7c95',
+    boardEdge:  '#ffffff',
+    boardShadow:'rgba(60,74,100,0.30)',
+    wall:       '#414a5a',
+    wallTop:    '#5c667a',
+    holeDark:   '#1d2330',
+    ice:        'rgba(205,242,255,0.46)',
+    iceEdge:    '#ffffff',
+    iceDeep:    '#5fb6dd',
+    iceInk:     '#0d4f6e',
+    gateBar:    '#ffffff',
+    crateEdge:  'rgba(24,30,44,0.55)',
+    coin:       '#ffc31f',
+    ink:        '#232c40',
+    inkSoft:    '#5b6880',
+    panel:      '#ffffff',
+    panelEdge:  '#b8c5da',
+    accent:     '#2f6bff',
+    accentDark: '#1f4dcc',
+    good:       '#22b562',
+    warn:       '#ff8a1f',
+    danger:     '#ff3b30',
+    star:       '#ffc31f',
+    starOff:    '#c2ccdc'
+  };
+
+  // Creature colours: bright + saturated. [body, highlight, outline]
+  var CREATURE_COLORS = [
+    { base: '#00c8f0', hi: '#8df0ff', line: '#006e88' }, // cyan
+    { base: '#ff3ea5', hi: '#ffa8d5', line: '#8f1257' }, // magenta
+    { base: '#ffc400', hi: '#ffe98a', line: '#8a6600' }, // yellow
+    { base: '#2fc93f', hi: '#a3f2a9', line: '#146b1c' }, // green
+    { base: '#ff8a1f', hi: '#ffd0a1', line: '#8a4400' }, // orange
+    { base: '#a259f5', hi: '#dcc0ff', line: '#54219c' }, // purple
+    { base: '#ff3b30', hi: '#ffb0aa', line: '#8f1109' }, // red
+    { base: '#2f6bff', hi: '#a9c3ff', line: '#123a99' }, // blue
+    { base: '#00bfa0', hi: '#8bf0de', line: '#006655' }, // teal
+    { base: '#b5651d', hi: '#e8b58a', line: '#5e3208' }  // brown
+  ];
+
+  // Layout bands on the 400x640 logical canvas
+  var TOP_H     = 74;
+  var BOARD_X   = 8,   BOARD_Y = 78;
+  var BOARD_W   = 384, BOARD_H = 452;
+  var BTN_Y     = 546, BTN_H   = 66;
+
+  /*
+   * Smallest logical size any tappable target may be.
+   * The canvas is letterboxed with scale = min(availW/400, availH/640); on the
+   * narrowest supported phone (360 CSS px wide, minus 2x6px safe padding) that
+   * scale is 348/400 = 0.87, so 58 logical px lands at 50.5 CSS px - safely
+   * over the 48 CSS px minimum.
+   */
+  var MIN_BTN = 58;
+
+  var SCREEN = { MENU: 'menu', PLAY: 'play', WIN: 'win', FAIL: 'fail', PAUSE: 'pause', LOADING: 'loading' };
+  var COMBO_WINDOW = 3.6;   // seconds between exits that still count as a chain
+
+  // =====================================================================
+  // Storage
+  // =====================================================================
+
+  var STORE_KEY = 'neonUnravel.v2';
+  var store = { furthest: 1, current: 1, sound: true, freeHints: 3, adsRemoved: false, coins: 0, stars: {} };
+
+  function loadStore() {
+    try {
+      var raw = window.localStorage.getItem(STORE_KEY);
+      if (raw) {
+        var o = JSON.parse(raw);
+        if (o && typeof o === 'object') {
+          store.furthest = Math.max(1, o.furthest | 0 || 1);
+          store.current = Math.max(1, Math.min(store.furthest, o.current | 0 || 1));
+          store.sound = o.sound !== false;
+          store.freeHints = typeof o.freeHints === 'number' ? o.freeHints : 3;
+          store.adsRemoved = !!o.adsRemoved;
+          store.coins = Math.max(0, o.coins | 0);
+          store.stars = (o.stars && typeof o.stars === 'object') ? o.stars : {};
+        }
+      }
+    } catch (e) { /* private mode - run with defaults */ }
+  }
+  function saveStore() {
+    try { window.localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch (e) {}
+  }
+
+  // =====================================================================
+  // AndroidBridge - every call guarded so the game runs standalone
+  // =====================================================================
+
+  function hasBridge() { return typeof window.AndroidBridge !== 'undefined' && !!window.AndroidBridge; }
+  function bridgeIsAdsRemoved() {
+    try { if (hasBridge() && typeof window.AndroidBridge.isAdsRemoved === 'function') return !!window.AndroidBridge.isAdsRemoved(); }
+    catch (e) {}
+    return false;
+  }
+  function bridgeShowBanner() {
+    try { if (hasBridge() && window.AndroidBridge.showBanner) { window.AndroidBridge.showBanner(); setBannerSlot(true); return; } } catch (e) {}
+    setBannerSlot(false);
+  }
+  function bridgeHideBanner() {
+    try { if (hasBridge() && window.AndroidBridge.hideBanner) window.AndroidBridge.hideBanner(); } catch (e) {}
+    setBannerSlot(false);
+  }
+  function bridgeShowInterstitial() {
+    try { if (hasBridge() && window.AndroidBridge.showInterstitial) { window.AndroidBridge.showInterstitial(); return true; } } catch (e) {}
+    return false;
+  }
+  function bridgeShowRewarded() {
+    try { if (hasBridge() && window.AndroidBridge.showRewarded) { window.AndroidBridge.showRewarded(); return true; } } catch (e) {}
+    return false;
+  }
+  function bridgePurchaseRemoveAds() {
+    try { if (hasBridge() && window.AndroidBridge.purchaseRemoveAds) { window.AndroidBridge.purchaseRemoveAds(); return true; } } catch (e) {}
+    return false;
+  }
+  function setBannerSlot(on) {
+    var el = document.getElementById('nu-banner-slot');
+    if (el) el.style.display = on ? 'block' : 'none';
+  }
+
+  // =====================================================================
+  // WebAudio - synthesized only, no files
+  // =====================================================================
+
+  var audio = { ctx: null, master: null, ready: false };
+
+  function audioInit() {
+    if (audio.ready) return;
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      audio.ctx = new AC();
+      audio.master = audio.ctx.createGain();
+      audio.master.gain.value = 0.34;
+      audio.master.connect(audio.ctx.destination);
+      audio.ready = true;
+    } catch (e) { audio.ready = false; }
+  }
+  function audioResume() {
+    if (audio.ready && audio.ctx.state === 'suspended') { try { audio.ctx.resume(); } catch (e) {} }
+  }
+  function tone(freq, dur, type, gain, delay, glideTo) {
+    if (!store.sound || !audio.ready) return;
+    try {
+      var t0 = audio.ctx.currentTime + (delay || 0);
+      var osc = audio.ctx.createOscillator();
+      var g = audio.ctx.createGain();
+      osc.type = type || 'sine';
+      osc.frequency.setValueAtTime(freq, t0);
+      if (glideTo) osc.frequency.exponentialRampToValueAtTime(Math.max(20, glideTo), t0 + dur);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(gain || 0.2, t0 + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.connect(g); g.connect(audio.master);
+      osc.start(t0); osc.stop(t0 + dur + 0.02);
+    } catch (e) {}
+  }
+  function noise(dur, gain, filterFreq, delay) {
+    if (!store.sound || !audio.ready) return;
+    try {
+      var t0 = audio.ctx.currentTime + (delay || 0);
+      var n = Math.floor(audio.ctx.sampleRate * dur);
+      var buf = audio.ctx.createBuffer(1, n, audio.ctx.sampleRate);
+      var d = buf.getChannelData(0);
+      for (var i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+      var src = audio.ctx.createBufferSource(); src.buffer = buf;
+      var f = audio.ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = filterFreq || 900;
+      var g = audio.ctx.createGain(); g.gain.value = gain || 0.15;
+      src.connect(f); f.connect(g); g.connect(audio.master);
+      src.start(t0);
+    } catch (e) {}
+  }
+  var lastStepSfx = 0;
+  function sfxStep() {
+    var now = Date.now();
+    if (now - lastStepSfx < 45) return;
+    lastStepSfx = now;
+    tone(360 + Math.random() * 60, 0.05, 'triangle', 0.055);
+  }
+  function sfxSlurp() {
+    tone(300, 0.34, 'sine', 0.18, 0, 1150);
+    noise(0.22, 0.10, 1500);
+  }
+  function sfxExited(idx) {
+    var base = 523.25;
+    var steps = [0, 4, 7, 12];
+    for (var i = 0; i < 4; i++) {
+      tone(base * Math.pow(2, (steps[i] + (idx % 3) * 2) / 12), 0.24, 'sine', 0.16, i * 0.055);
+    }
+  }
+  function sfxBlocked() {
+    tone(96, 0.14, 'sine', 0.22, 0, 62);
+    noise(0.09, 0.14, 320);
+  }
+  function sfxTap() { tone(660, 0.05, 'square', 0.07); }
+  function sfxShatter() {
+    noise(0.30, 0.20, 6500);
+    tone(1760, 0.20, 'triangle', 0.11, 0);
+    tone(2637, 0.26, 'sine', 0.09, 0.05);
+    tone(1318, 0.30, 'sine', 0.08, 0.10);
+  }
+  function sfxFrozen() {
+    tone(220, 0.14, 'sine', 0.16, 0, 150);
+    noise(0.10, 0.09, 2600);
+  }
+  function sfxCombo(n) {
+    var base = 659.25 * Math.pow(2, Math.min(6, n) / 12);
+    tone(base, 0.18, 'triangle', 0.14);
+    tone(base * 1.5, 0.22, 'sine', 0.11, 0.06);
+  }
+  function sfxCoin() { tone(1046, 0.10, 'square', 0.09); tone(1568, 0.14, 'square', 0.07, 0.06); }
+  function sfxWin() {
+    var seq = [523.25, 659.25, 783.99, 1046.5, 1318.5];
+    seq.forEach(function (f, i) { tone(f, 0.4, 'triangle', 0.15, i * 0.09); });
+    noise(0.5, 0.06, 3200, 0.05);
+  }
+  function sfxFail() {
+    tone(392, 0.5, 'sawtooth', 0.11, 0, 150);
+    tone(196, 0.6, 'sine', 0.10, 0.05, 90);
+  }
+  function sfxStar(i) { tone(880 * Math.pow(2, i / 12), 0.28, 'sine', 0.17, 0); }
+
+  // =====================================================================
+  // App state
+  // =====================================================================
+
+  var canvas, ctx, dpr = 1;
+  var app = {
+    screen: SCREEN.MENU,
+    level: 1,
+    game: null,
+    levelData: null,
+    timeLeft: 0,
+    timeLimit: 0,
+    elapsed: 0,
+    lastT: 0,
+    stars: 0,
+    hintCreature: -1,
+    hintUntil: 0,
+    pendingReward: null,     // 'hint' | 'continue'
+    winAt: 0,
+    completions: 0,
+    transition: 0,
+    toast: null,
+    boardShake: 0,
+    winDelay: 0.45,
+    combo: 0,
+    comboBest: 0,
+    lastExitAt: 0,
+    coinsEarned: 0,
+    shatters: [],
+    loadingLevel: 0
+  };
+
+  var layout = { cell: 40, ox: 0, oy: 0, minC: 0, minR: 0, gw: 1, gh: 1 };
+  var anims = {};            // creatureId -> animation record
+  var particles = [];
+  var floaters = [];
+  var uiButtons = [];
+  var pressedId = null;
+  var drag = null;
+
+  // =====================================================================
+  // Geometry
+  // =====================================================================
+
+  function computeLayout(level) {
+    var minC = 1e9, minR = 1e9, maxC = -1, maxR = -1;
+    var i, c, r;
+    for (r = 0; r < level.rows; r++) {
+      for (c = 0; c < level.cols; c++) {
+        if (level.region[c + r * level.cols]) {
+          if (c < minC) minC = c; if (c > maxC) maxC = c;
+          if (r < minR) minR = r; if (r > maxR) maxR = r;
+        }
+      }
+    }
+    for (i = 0; i < level.holes.length; i++) {
+      var h = level.holes[i];
+      if (h.c < minC) minC = h.c; if (h.c > maxC) maxC = h.c;
+      if (h.r < minR) minR = h.r; if (h.r > maxR) maxR = h.r;
+    }
+    // half a cell of breathing room around the holes
+    var gw = maxC - minC + 1, gh = maxR - minR + 1;
+    var cell = Math.min(BOARD_W / (gw + 0.3), BOARD_H / (gh + 0.3));
+    cell = Math.floor(cell * 2) / 2;
+    layout.cell = cell;
+    layout.gw = gw; layout.gh = gh;
+    layout.minC = minC; layout.minR = minR;
+    layout.ox = BOARD_X + (BOARD_W - cell * gw) / 2 - minC * cell;
+    layout.oy = BOARD_Y + (BOARD_H - cell * gh) / 2 - minR * cell;
+  }
+
+  function cx(c) { return layout.ox + c * layout.cell + layout.cell / 2; }
+  function cy(r) { return layout.oy + r * layout.cell + layout.cell / 2; }
+  function cellCenter(idx, cols) { var c = idx % cols; return { x: cx(c), y: cy((idx - c) / cols) }; }
+  function pxToCell(x, y) {
+    return { c: Math.floor((x - layout.ox) / layout.cell), r: Math.floor((y - layout.oy) / layout.cell) };
+  }
+
+  // =====================================================================
+  // Level lifecycle
+  // =====================================================================
+
+  /**
+   * Generating a hard level runs the full measure-and-reject loop, which can
+   * take up to about a second. Paint a LOADING frame first and generate on the
+   * next tick so the UI never appears frozen. Tests call startLevel() directly,
+   * which stays synchronous.
+   */
+  function requestLevel(n) {
+    app.loadingLevel = Math.max(1, n | 0);
+    app.screen = SCREEN.LOADING;
+    drag = null;
+    render();
+    window.setTimeout(function () { startLevel(app.loadingLevel); }, 24);
+  }
+
+  function startLevel(n) {
+    app.level = Math.max(1, n | 0);
+    app.levelData = Core.generateLevel(app.level);
+    app.game = new Core.Game(app.levelData);
+    computeLayout(app.levelData);
+    app.timeLimit = app.levelData.timeLimit;
+    app.timeLeft = app.timeLimit;
+    app.elapsed = 0;
+    app.stars = 0;
+    app.hintCreature = -1;
+    app.hintUntil = 0;
+    app.screen = SCREEN.PLAY;
+    app.transition = 1;
+    app.boardShake = 0;
+    app.winDelay = 0.45;
+    app.combo = 0;
+    app.comboBest = 0;
+    app.lastExitAt = 0;
+    app.coinsEarned = 0;
+    app.shatters.length = 0;
+    anims = {};
+    particles.length = 0;
+    floaters.length = 0;
+    drag = null;
+    store.current = app.level;
+    saveStore();
+    if (!store.adsRemoved) bridgeShowBanner(); else bridgeHideBanner();
+  }
+
+  function completeLevel() {
+    app.screen = SCREEN.WIN;
+    app.winAt = Date.now();
+    app.stars = Core.starsFor(app.timeLeft, app.timeLimit, app.game.moves, app.levelData.parMoves);
+    app.coinsEarned = Core.coinsFor(app.stars, app.level, app.comboBest);
+    store.coins += app.coinsEarned;
+    var key = String(app.level);
+    if (!store.stars[key] || store.stars[key] < app.stars) store.stars[key] = app.stars;
+    if (app.level + 1 > store.furthest) store.furthest = app.level + 1;
+    saveStore();
+    sfxWin();
+    for (var s = 0; s < app.stars; s++) tone(880 * Math.pow(2, s * 2 / 12), 0.3, 'sine', 0.14, 0.45 + s * 0.16);
+    burstConfetti();
+    app.completions++;
+    if (!store.adsRemoved && app.completions % 3 === 0) bridgeShowInterstitial();
+  }
+
+  function failLevel() {
+    app.screen = SCREEN.FAIL;
+    sfxFail();
+    drag = null;
+  }
+
+  // =====================================================================
+  // Particles / floaters
+  // =====================================================================
+
+  function burst(x, y, colorIdx, count) {
+    var col = CREATURE_COLORS[colorIdx % CREATURE_COLORS.length];
+    for (var i = 0; i < (count || 22); i++) {
+      var a = Math.random() * Math.PI * 2, sp = 40 + Math.random() * 170;
+      particles.push({
+        x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 40,
+        life: 0.55 + Math.random() * 0.45, age: 0,
+        size: 2.5 + Math.random() * 4.5,
+        color: Math.random() < 0.35 ? col.hi : col.base
+      });
+    }
+  }
+  /** Ice shatter: shards fly outward from every cell of the freed creature. */
+  function burstShatter(cr) {
+    var cols = app.game.cols;
+    for (var i = 0; i < cr.startCells.length + 2; i++) {
+      var idx = cr.cells[Math.min(i, cr.cells.length - 1)];
+      if (idx === undefined) break;
+      var p = cellCenter(idx, cols);
+      for (var k = 0; k < 7; k++) {
+        var a = Math.random() * Math.PI * 2, sp = 70 + Math.random() * 190;
+        particles.push({
+          x: p.x, y: p.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 60,
+          life: 0.5 + Math.random() * 0.45, age: 0,
+          size: 2 + Math.random() * 4.5,
+          color: Math.random() < 0.5 ? '#ffffff' : PAL.iceDeep, gravity: 620
+        });
+      }
+    }
+  }
+
+  function burstConfetti() {
+    for (var i = 0; i < 90; i++) {
+      var col = CREATURE_COLORS[i % CREATURE_COLORS.length];
+      particles.push({
+        x: W / 2 + (Math.random() - 0.5) * 240, y: 150 + Math.random() * 60,
+        vx: (Math.random() - 0.5) * 260, vy: -120 - Math.random() * 200,
+        life: 1.4 + Math.random() * 1.0, age: 0,
+        size: 3 + Math.random() * 5,
+        color: Math.random() < 0.4 ? col.hi : col.base, gravity: 460
+      });
+    }
+  }
+  function floatText(x, y, text, color) {
+    floaters.push({ x: x, y: y, text: text, color: color || PAL.ink, age: 0, life: 1.1 });
+  }
+  function updateParticles(dt) {
+    for (var i = particles.length - 1; i >= 0; i--) {
+      var p = particles[i];
+      p.age += dt;
+      if (p.age >= p.life) { particles.splice(i, 1); continue; }
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vy += (p.gravity || 340) * dt;
+      p.vx *= 0.985;
+    }
+    for (var j = floaters.length - 1; j >= 0; j--) {
+      var f = floaters[j];
+      f.age += dt;
+      if (f.age >= f.life) floaters.splice(j, 1);
+      else f.y = Math.max(TOP_H + 24, f.y - 34 * dt);
+    }
+  }
+
+  // =====================================================================
+  // Animation of the snake bodies
+  // =====================================================================
+
+  function animFor(id) {
+    if (!anims[id]) anims[id] = { t: 1, dur: 0.06, from: null, to: null, feed: false, holeIdx: -1, shake: 0, shakeDir: 0, glow: 0 };
+    return anims[id];
+  }
+
+  function beginStepAnim(id, fromCells, toCells, feed, holeIdx, dur) {
+    var a = animFor(id);
+    a.from = fromCells.slice();
+    a.to = toCells ? toCells.slice() : null;
+    a.feed = !!feed;
+    a.holeIdx = holeIdx === undefined ? -1 : holeIdx;
+    a.t = 0;
+    a.dur = dur || 0.062;
+  }
+
+  function updateAnims(dt) {
+    for (var k in anims) {
+      var a = anims[k];
+      if (a.t < 1) { a.t = Math.min(1, a.t + dt / Math.max(0.016, a.dur)); }
+      if (a.shake > 0) a.shake = Math.max(0, a.shake - dt * 3.6);
+      if (a.glow > 0) a.glow = Math.max(0, a.glow - dt * 1.6);
+    }
+  }
+
+  function easeOut(t) { return 1 - Math.pow(1 - t, 2.2); }
+
+  /** Rendered polyline for a creature, in canvas pixels. */
+  function renderPointsFor(cr) {
+    var cols = app.game.cols;
+    var a = anims[cr.id];
+    var pts = [], i;
+    if (!a || a.t >= 1 || !a.from) {
+      for (i = 0; i < cr.cells.length; i++) pts.push(cellCenter(cr.cells[i], cols));
+      return pts;
+    }
+    var t = easeOut(a.t);
+    if (a.feed) {
+      var holeC = a.holeIdx >= 0 ? cellCenter(a.holeIdx, cols) : cellCenter(a.from[0], cols);
+      for (i = 0; i < a.from.length; i++) {
+        var src = cellCenter(a.from[i], cols);
+        var dst = (i === 0) ? holeC : cellCenter(a.from[i - 1], cols);
+        pts.push({ x: src.x + (dst.x - src.x) * t, y: src.y + (dst.y - src.y) * t });
+      }
+      return pts;
+    }
+    var n = Math.max(a.from.length, a.to ? a.to.length : 0);
+    for (i = 0; i < n; i++) {
+      var s = cellCenter(a.from[Math.min(i, a.from.length - 1)], cols);
+      var d = a.to ? cellCenter(a.to[Math.min(i, a.to.length - 1)], cols) : s;
+      pts.push({ x: s.x + (d.x - s.x) * t, y: s.y + (d.y - s.y) * t });
+    }
+    return pts;
+  }
+
+  // =====================================================================
+  // Drawing primitives
+  // =====================================================================
+
+  function rr(x, y, w, h, r) {
+    ctx.beginPath();
+    r = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+  function fillRR(x, y, w, h, r, color) { rr(x, y, w, h, r); ctx.fillStyle = color; ctx.fill(); }
+  function strokeRR(x, y, w, h, r, color, lw) {
+    rr(x, y, w, h, r); ctx.strokeStyle = color; ctx.lineWidth = lw || 2; ctx.stroke();
+  }
+  function text(str, x, y, size, color, align, weight) {
+    ctx.font = (weight || '800') + ' ' + size + 'px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+    ctx.fillStyle = color; ctx.textAlign = align || 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(str, x, y);
+  }
+
+  /** Register + draw a tappable button. All buttons are >= 48 CSS px. */
+  function button(id, x, y, w, h, label, opts) {
+    opts = opts || {};
+    uiButtons.push({ id: id, x: x, y: y, w: w, h: h, action: opts.action, enabled: opts.enabled !== false });
+    var down = pressedId === id;
+    var enabled = opts.enabled !== false;
+    var dy = down ? 2 : 0;
+    var base = opts.color || PAL.panel;
+    var edge = opts.edge || PAL.panelEdge;
+    // drop shadow / 3d lip
+    if (enabled) { fillRR(x, y + 4, w, h, opts.radius || 16, opts.shadow || 'rgba(70,86,116,0.34)'); }
+    fillRR(x, y + dy, w, h - (down ? 2 : 0), opts.radius || 16, enabled ? base : '#e6ebf3');
+    strokeRR(x + 1, y + dy + 1, w - 2, h - 2 - (down ? 2 : 0), (opts.radius || 16) - 1, enabled ? edge : '#d3dbe7', 2);
+    var fg = enabled ? (opts.fg || PAL.ink) : '#9fabbf';
+    if (opts.icon) drawIcon(opts.icon, x + w / 2, y + dy + h / 2 - (opts.label ? 8 : 0), opts.iconSize || 22, fg);
+    if (label) {
+      text(label, x + w / 2, y + dy + h / 2 + (opts.icon ? 17 : 0), opts.size || 16, fg, 'center', opts.weight || '800');
+    }
+    if (opts.badge !== undefined && opts.badge !== null) {
+      var bw = 22;
+      fillRR(x + w - bw - 4, y + dy + 3, bw, 18, 9, opts.badgeColor || PAL.accent);
+      text(String(opts.badge), x + w - bw / 2 - 4, y + dy + 12, 11, '#fff', 'center', '900');
+    }
+    return uiButtons[uiButtons.length - 1];
+  }
+
+  function drawIcon(name, x, y, s, color) {
+    ctx.save();
+    ctx.strokeStyle = color; ctx.fillStyle = color;
+    ctx.lineWidth = Math.max(2.4, s * 0.16);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    var h = s / 2;
+    if (name === 'undo') {
+      ctx.beginPath();
+      ctx.arc(x, y + h * 0.15, h * 0.72, Math.PI * 0.85, Math.PI * 2.25);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x - h * 0.72, y - h * 0.55);
+      ctx.lineTo(x - h * 0.72, y + h * 0.16);
+      ctx.lineTo(x - h * 0.05, y + h * 0.16);
+      ctx.closePath(); ctx.fill();
+    } else if (name === 'restart') {
+      ctx.beginPath();
+      ctx.arc(x, y, h * 0.72, Math.PI * 0.35, Math.PI * 1.85);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x + h * 0.62, y - h * 0.72);
+      ctx.lineTo(x + h * 0.95, y + h * 0.08);
+      ctx.lineTo(x + h * 0.10, y - h * 0.16);
+      ctx.closePath(); ctx.fill();
+    } else if (name === 'hint') {
+      ctx.beginPath();
+      ctx.arc(x, y - h * 0.18, h * 0.55, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x - h * 0.26, y + h * 0.42); ctx.lineTo(x + h * 0.26, y + h * 0.42);
+      ctx.moveTo(x - h * 0.18, y + h * 0.75); ctx.lineTo(x + h * 0.18, y + h * 0.75);
+      ctx.stroke();
+    } else if (name === 'pause') {
+      ctx.lineWidth = Math.max(3, s * 0.22);
+      ctx.beginPath();
+      ctx.moveTo(x - h * 0.34, y - h * 0.6); ctx.lineTo(x - h * 0.34, y + h * 0.6);
+      ctx.moveTo(x + h * 0.34, y - h * 0.6); ctx.lineTo(x + h * 0.34, y + h * 0.6);
+      ctx.stroke();
+    } else if (name === 'play') {
+      ctx.beginPath();
+      ctx.moveTo(x - h * 0.42, y - h * 0.68);
+      ctx.lineTo(x + h * 0.72, y);
+      ctx.lineTo(x - h * 0.42, y + h * 0.68);
+      ctx.closePath(); ctx.fill();
+    } else if (name === 'sound') {
+      ctx.beginPath();
+      ctx.moveTo(x - h * 0.7, y - h * 0.28); ctx.lineTo(x - h * 0.3, y - h * 0.28);
+      ctx.lineTo(x + h * 0.05, y - h * 0.72); ctx.lineTo(x + h * 0.05, y + h * 0.72);
+      ctx.lineTo(x - h * 0.3, y + h * 0.28); ctx.lineTo(x - h * 0.7, y + h * 0.28);
+      ctx.closePath(); ctx.fill();
+      ctx.beginPath();
+      ctx.arc(x + h * 0.2, y, h * 0.42, -Math.PI / 3, Math.PI / 3); ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(x + h * 0.2, y, h * 0.72, -Math.PI / 3, Math.PI / 3); ctx.stroke();
+    } else if (name === 'mute') {
+      ctx.beginPath();
+      ctx.moveTo(x - h * 0.7, y - h * 0.28); ctx.lineTo(x - h * 0.3, y - h * 0.28);
+      ctx.lineTo(x + h * 0.05, y - h * 0.72); ctx.lineTo(x + h * 0.05, y + h * 0.72);
+      ctx.lineTo(x - h * 0.3, y + h * 0.28); ctx.lineTo(x - h * 0.7, y + h * 0.28);
+      ctx.closePath(); ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(x + h * 0.28, y - h * 0.36); ctx.lineTo(x + h * 0.86, y + h * 0.36);
+      ctx.moveTo(x + h * 0.86, y - h * 0.36); ctx.lineTo(x + h * 0.28, y + h * 0.36);
+      ctx.stroke();
+    } else if (name === 'home') {
+      ctx.beginPath();
+      ctx.moveTo(x, y - h * 0.7); ctx.lineTo(x + h * 0.8, y);
+      ctx.lineTo(x + h * 0.55, y); ctx.lineTo(x + h * 0.55, y + h * 0.7);
+      ctx.lineTo(x - h * 0.55, y + h * 0.7); ctx.lineTo(x - h * 0.55, y);
+      ctx.lineTo(x - h * 0.8, y);
+      ctx.closePath(); ctx.fill();
+    } else if (name === 'clock') {
+      ctx.beginPath(); ctx.arc(x, y, h * 0.78, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(x, y - h * 0.42); ctx.lineTo(x, y); ctx.lineTo(x + h * 0.34, y + h * 0.2);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawStar(x, y, r, filled) {
+    ctx.beginPath();
+    for (var i = 0; i < 10; i++) {
+      var ang = -Math.PI / 2 + i * Math.PI / 5;
+      var rad = i % 2 === 0 ? r : r * 0.46;
+      var px = x + Math.cos(ang) * rad, py = y + Math.sin(ang) * rad;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.fillStyle = filled ? PAL.star : PAL.starOff;
+    ctx.fill();
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = filled ? '#c98f00' : '#a9b5c9';
+    ctx.stroke();
+  }
+
+  // =====================================================================
+  // Board rendering
+  // =====================================================================
+
+  function drawBoard() {
+    var lv = app.levelData, g = app.game;
+    var cell = layout.cell, cols = lv.cols;
+    var c, r, i;
+
+    ctx.save();
+    if (app.boardShake > 0) {
+      ctx.translate((Math.random() - 0.5) * app.boardShake, (Math.random() - 0.5) * app.boardShake);
+    }
+
+    // --- soft drop shadow behind the whole playable region
+    ctx.save();
+    ctx.shadowColor = PAL.boardShadow;
+    ctx.shadowBlur = 16; ctx.shadowOffsetY = 6;
+    ctx.fillStyle = PAL.boardCell;
+    for (r = 0; r < lv.rows; r++) {
+      for (c = 0; c < lv.cols; c++) {
+        if (!lv.region[c + r * cols]) continue;
+        ctx.fillRect(layout.ox + c * cell, layout.oy + r * cell, cell + 0.6, cell + 0.6);
+      }
+    }
+    ctx.restore();
+
+    // --- cells with a subtle checker so the grid reads clearly
+    for (r = 0; r < lv.rows; r++) {
+      for (c = 0; c < lv.cols; c++) {
+        i = c + r * cols;
+        if (!lv.region[i]) continue;
+        ctx.fillStyle = ((c + r) & 1) ? PAL.boardCell : PAL.boardCellAlt;
+        ctx.fillRect(layout.ox + c * cell, layout.oy + r * cell, cell + 0.6, cell + 0.6);
+      }
+    }
+
+    // --- internal gridlines
+    ctx.strokeStyle = PAL.boardLine;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (r = 0; r < lv.rows; r++) {
+      for (c = 0; c < lv.cols; c++) {
+        i = c + r * cols;
+        if (!lv.region[i]) continue;
+        var x0 = layout.ox + c * cell, y0 = layout.oy + r * cell;
+        if (c + 1 < lv.cols && lv.region[i + 1]) { ctx.moveTo(x0 + cell, y0 + 2); ctx.lineTo(x0 + cell, y0 + cell - 2); }
+        if (r + 1 < lv.rows && lv.region[i + cols]) { ctx.moveTo(x0 + 2, y0 + cell); ctx.lineTo(x0 + cell - 2, y0 + cell); }
+      }
+    }
+    ctx.stroke();
+
+    // --- crisp white perimeter around the irregular region
+    ctx.strokeStyle = PAL.boardEdge;
+    ctx.lineWidth = Math.max(3, cell * 0.10);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    for (r = 0; r < lv.rows; r++) {
+      for (c = 0; c < lv.cols; c++) {
+        i = c + r * cols;
+        if (!lv.region[i]) continue;
+        var bx = layout.ox + c * cell, by = layout.oy + r * cell;
+        if (r === 0 || !lv.region[i - cols]) { ctx.moveTo(bx, by); ctx.lineTo(bx + cell, by); }
+        if (r === lv.rows - 1 || !lv.region[i + cols]) { ctx.moveTo(bx, by + cell); ctx.lineTo(bx + cell, by + cell); }
+        if (c === 0 || !lv.region[i - 1]) { ctx.moveTo(bx, by); ctx.lineTo(bx, by + cell); }
+        if (c === lv.cols - 1 || !lv.region[i + 1]) { ctx.moveTo(bx + cell, by); ctx.lineTo(bx + cell, by + cell); }
+      }
+    }
+    ctx.stroke();
+
+    // --- colour gates: only a matching creature may pass
+    for (r = 0; r < lv.rows; r++) {
+      for (c = 0; c < lv.cols; c++) {
+        i = c + r * cols;
+        var gv = lv.gate ? lv.gate[i] : 0;
+        if (!gv) continue;
+        var gcol = CREATURE_COLORS[(gv - 1) % CREATURE_COLORS.length];
+        var gx = layout.ox + c * cell, gy = layout.oy + r * cell;
+        ctx.save();
+        fillRR(gx + cell * 0.06, gy + cell * 0.06, cell * 0.88, cell * 0.88, cell * 0.18, gcol.line);
+        ctx.globalAlpha = 0.30;
+        fillRR(gx + cell * 0.10, gy + cell * 0.10, cell * 0.80, cell * 0.80, cell * 0.15, gcol.base);
+        ctx.globalAlpha = 1;
+        // vertical bars
+        ctx.strokeStyle = gcol.base;
+        ctx.lineWidth = Math.max(2.4, cell * 0.09);
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        for (var bi = 0; bi < 3; bi++) {
+          var bx = gx + cell * (0.26 + bi * 0.24);
+          ctx.moveTo(bx, gy + cell * 0.20);
+          ctx.lineTo(bx, gy + cell * 0.80);
+        }
+        ctx.stroke();
+        ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+        ctx.lineWidth = Math.max(1.2, cell * 0.035);
+        ctx.beginPath();
+        ctx.moveTo(gx + cell * 0.18, gy + cell * 0.22);
+        ctx.lineTo(gx + cell * 0.82, gy + cell * 0.22);
+        ctx.moveTo(gx + cell * 0.18, gy + cell * 0.78);
+        ctx.lineTo(gx + cell * 0.82, gy + cell * 0.78);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    // --- solid crates: blocky, no head, no eyes - never mistakable for a creature
+    for (r = 0; r < lv.rows; r++) {
+      for (c = 0; c < lv.cols; c++) {
+        i = c + r * cols;
+        var cv = lv.crate ? lv.crate[i] : 0;
+        if (!cv) continue;
+        var ccol = CREATURE_COLORS[(cv - 1) % CREATURE_COLORS.length];
+        var kx = layout.ox + c * cell + cell * 0.07, ky = layout.oy + r * cell + cell * 0.07;
+        var ks = cell * 0.86;
+        fillRR(kx, ky + 2.5, ks, ks, cell * 0.10, 'rgba(20,26,38,0.35)');
+        fillRR(kx, ky, ks, ks, cell * 0.10, ccol.base);
+        strokeRR(kx + 1, ky + 1, ks - 2, ks - 2, cell * 0.09, ccol.line, Math.max(2, cell * 0.07));
+        // plank cross-bracing so it reads as cargo, not a body segment
+        ctx.save();
+        ctx.strokeStyle = ccol.line;
+        ctx.globalAlpha = 0.75;
+        ctx.lineWidth = Math.max(1.6, cell * 0.055);
+        ctx.beginPath();
+        ctx.moveTo(kx + ks * 0.16, ky + ks * 0.16); ctx.lineTo(kx + ks * 0.84, ky + ks * 0.84);
+        ctx.moveTo(kx + ks * 0.84, ky + ks * 0.16); ctx.lineTo(kx + ks * 0.16, ky + ks * 0.84);
+        ctx.stroke();
+        ctx.globalAlpha = 0.55;
+        ctx.strokeStyle = ccol.hi;
+        ctx.lineWidth = Math.max(1.4, cell * 0.05);
+        ctx.beginPath();
+        ctx.moveTo(kx + ks * 0.16, ky + ks * 0.17); ctx.lineTo(kx + ks * 0.84, ky + ks * 0.17);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    // --- rock blocks
+    for (r = 0; r < lv.rows; r++) {
+      for (c = 0; c < lv.cols; c++) {
+        i = c + r * cols;
+        if (!lv.wall[i]) continue;
+        var wx = layout.ox + c * cell + cell * 0.09, wy = layout.oy + r * cell + cell * 0.09;
+        var ws = cell * 0.82;
+        fillRR(wx, wy + 2, ws, ws, cell * 0.20, 'rgba(20,26,38,0.35)');
+        fillRR(wx, wy, ws, ws, cell * 0.20, PAL.wall);
+        fillRR(wx + ws * 0.13, wy + ws * 0.11, ws * 0.74, ws * 0.26, cell * 0.10, PAL.wallTop);
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawCreature(cr, isDragged) {
+    if (cr.exited) {
+      var a0 = anims[cr.id];
+      if (!a0 || a0.t >= 1 || !a0.feed) return;   // still finishing its slurp
+    }
+    var pts = renderPointsFor(cr);
+    if (!pts.length) return;
+    var col = CREATURE_COLORS[cr.color % CREATURE_COLORS.length];
+    var cell = layout.cell;
+    var wBody = cell * 0.62;
+    var a = anims[cr.id];
+
+    ctx.save();
+    if (a && a.shake > 0) {
+      var d = Core.DIRS[a.shakeDir] || { dc: 0, dr: 0 };
+      var amp = a.shake * cell * 0.16 * Math.sin(a.shake * 22);
+      ctx.translate(d.dc * amp, d.dr * amp);
+    }
+
+    // grabbed / hinted glow
+    var glow = 0;
+    if (isDragged) glow = 1;
+    else if (app.hintCreature === cr.id && Date.now() < app.hintUntil) glow = 0.55 + 0.45 * Math.sin(Date.now() / 130);
+    else if (a && a.glow > 0) glow = a.glow;
+    if (glow > 0) {
+      ctx.save();
+      ctx.strokeStyle = col.hi;
+      ctx.globalAlpha = 0.34 * glow;
+      ctx.lineWidth = wBody + cell * (0.30 + 0.10 * Math.sin(Date.now() / 150));
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      strokePath(pts);
+      ctx.restore();
+    }
+
+    // dark outline
+    ctx.strokeStyle = col.line;
+    ctx.lineWidth = wBody + Math.max(3.5, cell * 0.12);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    strokePath(pts);
+
+    // body
+    ctx.strokeStyle = col.base;
+    ctx.lineWidth = wBody;
+    strokePath(pts);
+
+    // glossy highlight along the top of the body
+    ctx.save();
+    ctx.globalAlpha = 0.5;
+    ctx.strokeStyle = col.hi;
+    ctx.lineWidth = wBody * 0.30;
+    ctx.translate(0, -wBody * 0.20);
+    strokePath(pts, 0.72);
+    ctx.restore();
+
+    // grab chevron on the segment behind the head
+    if (pts.length >= 2 && cr.ice <= 0) drawChevron(pts, col, cell);
+
+    // head
+    drawHead(cr, pts, col, cell, isDragged);
+
+    // frozen casing + countdown
+    if (cr.ice > 0) drawIce(cr, pts, cell);
+    ctx.restore();
+  }
+
+  /**
+   * Frosted ice casing. The creature underneath stays readable (the overlay is
+   * translucent) but the countdown makes the ordering constraint legible: you
+   * must free that many other creatures before this one thaws.
+   */
+  function drawIce(cr, pts, cell) {
+    var w = cell * 0.62;
+    ctx.save();
+
+    // frosted casing - deliberately translucent so the creature's own colour
+    // still reads through; the player must be able to tell WHICH creature is
+    // frozen at a glance
+    ctx.strokeStyle = PAL.ice;
+    ctx.lineWidth = w + cell * 0.30;
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    strokePath(pts);
+
+    // crisp rim
+    ctx.globalAlpha = 0.85;
+    ctx.strokeStyle = PAL.iceEdge;
+    ctx.lineWidth = Math.max(1.8, cell * 0.055);
+    strokePath(pts);
+
+    // a few crystal facets
+    ctx.globalAlpha = 0.42;
+    ctx.strokeStyle = PAL.iceDeep;
+    ctx.lineWidth = Math.max(1, cell * 0.028);
+    for (var i = 0; i < pts.length; i += 2) {
+      var p = pts[i];
+      var sz = cell * 0.17;
+      ctx.beginPath();
+      ctx.moveTo(p.x - sz, p.y - sz * 0.5); ctx.lineTo(p.x + sz * 0.2, p.y + sz);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+
+    // countdown badge on the head
+    var h = pts[0];
+    var rBadge = cell * 0.30;
+    ctx.beginPath(); ctx.arc(h.x, h.y, rBadge + Math.max(2, cell * 0.055), 0, Math.PI * 2);
+    ctx.fillStyle = PAL.iceEdge; ctx.fill();
+    ctx.beginPath(); ctx.arc(h.x, h.y, rBadge, 0, Math.PI * 2);
+    ctx.fillStyle = PAL.iceDeep; ctx.fill();
+    text(String(cr.ice), h.x, h.y + 0.5, Math.max(12, cell * 0.40), '#ffffff', 'center', '900');
+    ctx.restore();
+  }
+
+  function strokePath(pts, shrink) {
+    if (pts.length === 1) {
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      ctx.lineTo(pts[0].x + 0.01, pts[0].y);
+      ctx.stroke();
+      return;
+    }
+    var n = shrink ? Math.max(2, Math.ceil(pts.length * (shrink || 1))) : pts.length;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (var i = 1; i < n; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
+  }
+
+  function drawChevron(pts, col, cell) {
+    var i = Math.min(1, pts.length - 1);
+    var p = pts[i], q = pts[i - 1];
+    var dx = q.x - p.x, dy = q.y - p.y;
+    var len = Math.hypot(dx, dy) || 1;
+    dx /= len; dy /= len;
+    var px = -dy, py = dx;
+    var s = cell * 0.15;
+    ctx.save();
+    ctx.globalAlpha = 0.85;
+    ctx.strokeStyle = 'rgba(255,255,255,0.92)';
+    ctx.lineWidth = Math.max(2, cell * 0.075);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(p.x - dx * s * 0.2 + px * s, p.y - dy * s * 0.2 + py * s);
+    ctx.lineTo(p.x + dx * s * 1.0, p.y + dy * s * 1.0);
+    ctx.lineTo(p.x - dx * s * 0.2 - px * s, p.y - dy * s * 0.2 - py * s);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawHead(cr, pts, col, cell, isDragged) {
+    var h = pts[0];
+    var nxt = pts.length > 1 ? pts[1] : { x: h.x, y: h.y + 1 };
+    var dx = h.x - nxt.x, dy = h.y - nxt.y;
+    var len = Math.hypot(dx, dy);
+    if (len < 0.001) { dx = 0; dy = -1; } else { dx /= len; dy /= len; }
+
+    var a = anims[cr.id];
+    var shrink = 1;
+    if (a && a.feed && a.t < 1) shrink = Math.max(0.18, 1 - easeOut(a.t) * 0.55);
+    var rHead = cell * 0.375 * shrink * (isDragged ? 1.06 : 1);
+
+    // cap
+    ctx.beginPath(); ctx.arc(h.x, h.y, rHead + Math.max(2.2, cell * 0.06), 0, Math.PI * 2);
+    ctx.fillStyle = col.line; ctx.fill();
+    ctx.beginPath(); ctx.arc(h.x, h.y, rHead, 0, Math.PI * 2);
+    ctx.fillStyle = col.base; ctx.fill();
+    // gloss
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    ctx.beginPath(); ctx.arc(h.x - rHead * 0.28, h.y - rHead * 0.36, rHead * 0.48, 0, Math.PI * 2);
+    ctx.fillStyle = col.hi; ctx.fill();
+    ctx.restore();
+
+    if (shrink < 0.55) return;
+
+    // two simple eyes, offset along the facing direction
+    var px = -dy, py = dx;
+    var eo = rHead * 0.42, fo = rHead * 0.30;
+    var er = rHead * 0.30;
+    for (var s = -1; s <= 1; s += 2) {
+      var ex = h.x + dx * fo + px * eo * s;
+      var ey = h.y + dy * fo + py * eo * s;
+      ctx.beginPath(); ctx.arc(ex, ey, er, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff'; ctx.fill();
+      ctx.lineWidth = Math.max(1, cell * 0.02); ctx.strokeStyle = 'rgba(20,26,38,0.35)'; ctx.stroke();
+      ctx.beginPath(); ctx.arc(ex + dx * er * 0.30, ey + dy * er * 0.30, er * 0.50, 0, Math.PI * 2);
+      ctx.fillStyle = '#1d2330'; ctx.fill();
+    }
+  }
+
+  /**
+   * Gate bars are painted ON TOP of the creatures. A gate underneath a body
+   * would otherwise be invisible, and the player would have no way to know a
+   * route is colour-locked.
+   */
+  function drawGateOverlay() {
+    var lv = app.levelData, cell = layout.cell, cols = lv.cols;
+    if (!lv.gate) return;
+    for (var r = 0; r < lv.rows; r++) {
+      for (var c = 0; c < lv.cols; c++) {
+        var gv = lv.gate[c + r * cols];
+        if (!gv) continue;
+        var gcol = CREATURE_COLORS[(gv - 1) % CREATURE_COLORS.length];
+        var gx = layout.ox + c * cell, gy = layout.oy + r * cell;
+        ctx.save();
+        ctx.strokeStyle = gcol.line;
+        ctx.lineWidth = Math.max(2.6, cell * 0.10);
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        for (var bi = 0; bi < 3; bi++) {
+          var bx = gx + cell * (0.26 + bi * 0.24);
+          ctx.moveTo(bx, gy + cell * 0.16);
+          ctx.lineTo(bx, gy + cell * 0.84);
+        }
+        ctx.stroke();
+        ctx.strokeStyle = gcol.base;
+        ctx.lineWidth = Math.max(1.4, cell * 0.055);
+        ctx.beginPath();
+        for (var bj = 0; bj < 3; bj++) {
+          var bx2 = gx + cell * (0.26 + bj * 0.24);
+          ctx.moveTo(bx2, gy + cell * 0.16);
+          ctx.lineTo(bx2, gy + cell * 0.84);
+        }
+        ctx.stroke();
+        // frame
+        strokeRR(gx + cell * 0.07, gy + cell * 0.07, cell * 0.86, cell * 0.86,
+                 cell * 0.16, gcol.line, Math.max(2, cell * 0.07));
+        strokeRR(gx + cell * 0.07, gy + cell * 0.07, cell * 0.86, cell * 0.86,
+                 cell * 0.16, gcol.hi, Math.max(1, cell * 0.03));
+        ctx.restore();
+      }
+    }
+  }
+
+  function drawHoles() {
+    var lv = app.levelData, cell = layout.cell;
+    for (var i = 0; i < lv.holes.length; i++) {
+      var hole = lv.holes[i];
+      var col = CREATURE_COLORS[hole.color % CREATURE_COLORS.length];
+      var x = cx(hole.c), y = cy(hole.r);
+      var R = cell * 0.44;
+
+      // any creature of this colour still on the board? -> pulse it
+      var live = false;
+      for (var k = 0; k < app.game.creatures.length; k++) {
+        if (!app.game.creatures[k].exited && app.game.creatures[k].color === hole.color) { live = true; break; }
+      }
+      var pulse = live ? 1 + 0.05 * Math.sin(Date.now() / 320 + i) : 1;
+
+      ctx.save();
+      ctx.globalAlpha = live ? 1 : 0.42;
+
+      // "throat": a short coloured chute joining the hole to each mouth cell,
+      // so it is unambiguous which board cell feeds this hole.
+      for (var mm = 0; mm < hole.mouths.length; mm++) {
+        var mIdx = hole.mouths[mm];
+        var mc = mIdx % lv.cols, mr = (mIdx - (mIdx % lv.cols)) / lv.cols;
+        var tx = cx(mc), ty = cy(mr);
+        ctx.save();
+        ctx.strokeStyle = col.line;
+        ctx.lineWidth = cell * 0.40;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + (tx - x) * 0.62, y + (ty - y) * 0.62);
+        ctx.stroke();
+        ctx.strokeStyle = col.base;
+        ctx.lineWidth = cell * 0.26;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + (tx - x) * 0.60, y + (ty - y) * 0.60);
+        ctx.stroke();
+        ctx.restore();
+      }
+      // outer ring
+      ctx.beginPath(); ctx.arc(x, y, R * pulse, 0, Math.PI * 2);
+      ctx.fillStyle = col.line; ctx.fill();
+      ctx.beginPath(); ctx.arc(x, y, R * pulse * 0.90, 0, Math.PI * 2);
+      ctx.fillStyle = col.base; ctx.fill();
+      ctx.beginPath(); ctx.arc(x - R * 0.18, y - R * 0.22, R * 0.62, Math.PI * 0.9, Math.PI * 1.9);
+      ctx.strokeStyle = col.hi; ctx.lineWidth = Math.max(2, cell * 0.06); ctx.stroke();
+      // dark mouth (opaque - hides segments as they feed in)
+      ctx.beginPath(); ctx.arc(x, y, R * 0.60, 0, Math.PI * 2);
+      ctx.fillStyle = PAL.holeDark; ctx.fill();
+      ctx.beginPath(); ctx.arc(x, y, R * 0.60, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // =====================================================================
+  // Screens
+  // =====================================================================
+
+  function drawBackground() {
+    var grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, PAL.bgTop);
+    grad.addColorStop(0.55, PAL.bg);
+    grad.addColorStop(1, PAL.bgDeep);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawTopBar() {
+    var lv = app.level;
+    // level pill
+    fillRR(10, 12, 104, 48, 14, PAL.panel);
+    strokeRR(11, 13, 102, 46, 13, PAL.panelEdge, 2);
+    text('LEVEL', 62, 26, 10, PAL.inkSoft, 'center', '800');
+    text(String(lv), 62, 41, 19, PAL.ink, 'center', '900');
+    var diff = app.levelData && app.levelData.difficulty;
+    if (diff) {
+      var dc = diff.score >= 80 ? PAL.danger : diff.score >= 60 ? PAL.warn
+             : diff.score >= 35 ? PAL.accent : PAL.good;
+      fillRR(16, 50, 92, 13, 6.5, dc);
+      text(diff.label, 62, 57, 9, '#ffffff', 'center', '900');
+    }
+
+    // timer
+    var frac = app.timeLimit > 0 ? app.timeLeft / app.timeLimit : 0;
+    var low = app.timeLeft <= 15;
+    var timerCol = low ? PAL.danger : (frac < 0.35 ? PAL.warn : PAL.ink);
+    fillRR(120, 12, 124, 48, 14, PAL.panel);
+    strokeRR(121, 13, 122, 46, 13, low ? PAL.danger : PAL.panelEdge, low ? 3 : 2);
+    var mm = Math.floor(Math.max(0, app.timeLeft) / 60);
+    var ss = Math.floor(Math.max(0, app.timeLeft) % 60);
+    drawIcon('clock', 143, 35, 19, timerCol);
+    text(mm + ':' + (ss < 10 ? '0' : '') + ss, 191, 35, 23, timerCol, 'center', '900');
+    ctx.save();
+    rr(125, 51, 114, 5, 2.5); ctx.clip();
+    ctx.fillStyle = '#e2e8f2'; ctx.fillRect(125, 51, 114, 5);
+    ctx.fillStyle = low ? PAL.danger : (frac < 0.35 ? PAL.warn : PAL.good);
+    ctx.fillRect(125, 51, 114 * Math.max(0, Math.min(1, frac)), 5);
+    ctx.restore();
+
+    // remaining creatures counter
+    fillRR(250, 12, 52, 48, 14, PAL.panel);
+    strokeRR(251, 13, 50, 46, 13, PAL.panelEdge, 2);
+    text(String(app.game ? app.game.remainingCount() : 0), 276, 29, 20, PAL.ink, 'center', '900');
+    text('LEFT', 276, 47, 10, PAL.inkSoft, 'center', '800');
+
+    button('pause', 332, 8, MIN_BTN, MIN_BTN, null,
+      { icon: 'pause', iconSize: 23, action: doPause, radius: 17 });
+  }
+
+  function drawPlayButtons() {
+    var m = 10, gap = 9;
+    var bw = (W - m * 2 - gap * 3) / 4;
+    var g = app.game;
+    button('undo', m, BTN_Y, bw, BTN_H, 'UNDO',
+      { icon: 'undo', action: doUndo, enabled: !!(g && g.canUndo()), size: 12 });
+    button('restart', m + (bw + gap), BTN_Y, bw, BTN_H, 'RESTART',
+      { icon: 'restart', action: doRestart, size: 12 });
+    button('hint', m + (bw + gap) * 2, BTN_Y, bw, BTN_H, 'HINT',
+      { icon: 'hint', action: doHint, size: 12,
+        badge: store.freeHints > 0 ? store.freeHints : 'AD',
+        badgeColor: store.freeHints > 0 ? PAL.accent : PAL.warn });
+    button('menu', m + (bw + gap) * 3, BTN_Y, bw, BTN_H, 'MENU',
+      { icon: 'home', action: doMenu, size: 12 });
+  }
+
+  function drawPlay() {
+    drawBackground();
+    drawTopBar();
+    drawBoard();
+
+    var g = app.game;
+    var dragId = drag ? drag.creatureId : -1;
+    // non-dragged first so the grabbed creature renders on top
+    for (var i = 0; i < g.creatures.length; i++) if (g.creatures[i].id !== dragId) drawCreature(g.creatures[i], false);
+    if (dragId >= 0) drawCreature(g.creatures[dragId], true);
+
+    drawGateOverlay();
+    drawHoles();
+    drawParticles();
+    drawFloaters();
+    drawPlayButtons();
+
+    if (app.transition > 0) {
+      ctx.save();
+      ctx.globalAlpha = app.transition * 0.85;
+      ctx.fillStyle = PAL.bg;
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+    }
+    if (app.toast && Date.now() < app.toast.until) {
+      var tw = ctx.measureText(app.toast.text).width;
+      fillRR(W / 2 - 130, 496, 260, 34, 17, 'rgba(35,44,64,0.92)');
+      text(app.toast.text, W / 2, 513, 14, '#fff', 'center', '800');
+    }
+  }
+
+  function drawParticles() {
+    for (var i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      var k = 1 - p.age / p.life;
+      ctx.globalAlpha = Math.max(0, Math.min(1, k * 1.4));
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size * (0.4 + k * 0.6), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawFloaters() {
+    for (var i = 0; i < floaters.length; i++) {
+      var f = floaters[i];
+      var k = 1 - f.age / f.life;
+      ctx.globalAlpha = Math.max(0, Math.min(1, k * 1.5));
+      text(f.text, f.x, f.y, 20, f.color, 'center', '900');
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawMenu() {
+    drawBackground();
+
+    // decorative creatures
+    var t = Date.now() / 1000;
+    for (var d = 0; d < 3; d++) {
+      var col = CREATURE_COLORS[[0, 1, 3][d]];
+      var baseY = 470 + d * 44;
+      ctx.save();
+      ctx.globalAlpha = 0.35;
+      ctx.strokeStyle = col.base;
+      ctx.lineWidth = 22; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.beginPath();
+      for (var s = 0; s <= 22; s++) {
+        var x = -20 + s * 20;
+        var y = baseY + Math.sin(s * 0.55 + t * (0.7 + d * 0.25) + d) * 13;
+        if (s === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    text('NEON', W / 2, 128, 54, PAL.ink, 'center', '900');
+    ctx.save();
+    var lg = ctx.createLinearGradient(60, 0, 340, 0);
+    lg.addColorStop(0, '#00c8f0'); lg.addColorStop(0.5, '#a259f5'); lg.addColorStop(1, '#ff3ea5');
+    ctx.fillStyle = lg;
+    ctx.font = '900 54px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('UNRAVEL', W / 2, 182);
+    ctx.restore();
+
+    text('Drag each head into its matching hole', W / 2, 226, 15, PAL.inkSoft, 'center', '700');
+    text('The body follows like a snake', W / 2, 248, 13, PAL.inkSoft, 'center', '600');
+
+    fillRR(60, 282, 134, 62, 18, PAL.panel);
+    strokeRR(61, 283, 132, 60, 17, PAL.panelEdge, 2);
+    text('FURTHEST', 127, 300, 10, PAL.inkSoft, 'center', '800');
+    text(String(store.furthest), 127, 324, 24, PAL.ink, 'center', '900');
+    fillRR(206, 282, 134, 62, 18, PAL.panel);
+    strokeRR(207, 283, 132, 60, 17, PAL.panelEdge, 2);
+    text('COINS', 273, 300, 10, PAL.inkSoft, 'center', '800');
+    ctx.beginPath(); ctx.arc(248, 324, 9, 0, Math.PI * 2);
+    ctx.fillStyle = PAL.coin; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#c98f00'; ctx.stroke();
+    text(String(store.coins), 288, 324, 20, PAL.ink, 'center', '900');
+
+    button('play', 70, 362, 260, 74, 'PLAY',
+      { action: doPlay, color: PAL.accent, edge: PAL.accentDark, fg: '#ffffff', size: 26, radius: 20,
+        shadow: 'rgba(20,52,140,0.42)' });
+
+    if (store.furthest > 1) {
+      button('replay1', 70, 446, 124, MIN_BTN, 'LEVEL 1',
+        { action: function () { requestLevel(1); }, size: 14 });
+      button('cont', 206, 446, 124, MIN_BTN, 'LEVEL ' + store.current,
+        { action: function () { requestLevel(store.current); }, size: 14 });
+    }
+
+    button('sound', 10, 570, MIN_BTN, MIN_BTN, null,
+      { icon: store.sound ? 'sound' : 'mute', iconSize: 22, action: doToggleSound, radius: 16 });
+    if (!store.adsRemoved) {
+      button('noads', 120, 570, 168, MIN_BTN, 'REMOVE ADS',
+        { action: doRemoveAds, size: 13, radius: 16 });
+    }
+  }
+
+  function drawPanel(x, y, w, h) {
+    fillRR(x, y + 6, w, h, 24, 'rgba(52,66,92,0.30)');
+    fillRR(x, y, w, h, 24, PAL.panel);
+    strokeRR(x + 1.5, y + 1.5, w - 3, h - 3, 22, PAL.panelEdge, 3);
+  }
+
+  function drawWin() {
+    drawPlay();
+    ctx.fillStyle = 'rgba(223,230,240,0.80)';
+    ctx.fillRect(0, 0, W, H);
+    drawParticles();
+
+    var age = (Date.now() - app.winAt) / 1000;
+    var pop = Math.min(1, age / 0.28);
+    var scale = 0.82 + 0.18 * (1 - Math.pow(1 - pop, 3));
+
+    ctx.save();
+    ctx.translate(W / 2, 300);
+    ctx.scale(scale, scale);
+    ctx.translate(-W / 2, -300);
+
+    drawPanel(40, 128, 320, 340);
+    text('LEVEL ' + app.level, W / 2, 172, 15, PAL.inkSoft, 'center', '800');
+    text('COMPLETE!', W / 2, 206, 34, PAL.ink, 'center', '900');
+
+    for (var s = 0; s < 3; s++) {
+      var shown = age > 0.35 + s * 0.22;
+      var sx = W / 2 + (s - 1) * 68;
+      var sc = shown ? 1 : 0.55;
+      ctx.save();
+      ctx.translate(sx, 268); ctx.scale(sc, sc); ctx.translate(-sx, -268);
+      drawStar(sx, 268, 30, shown && s < app.stars);
+      ctx.restore();
+    }
+
+    text('Time left', W / 2 - 92, 326, 11, PAL.inkSoft, 'center', '700');
+    text(Math.ceil(app.timeLeft) + 's', W / 2 - 92, 347, 18, PAL.ink, 'center', '900');
+    text('Moves / par', W / 2, 326, 11, PAL.inkSoft, 'center', '700');
+    text(app.game.moves + ' / ' + app.levelData.parMoves, W / 2, 347, 18, PAL.ink, 'center', '900');
+    text('Coins', W / 2 + 92, 326, 11, PAL.inkSoft, 'center', '700');
+    ctx.beginPath(); ctx.arc(W / 2 + 70, 347, 8, 0, Math.PI * 2);
+    ctx.fillStyle = PAL.coin; ctx.fill();
+    ctx.lineWidth = 2; ctx.strokeStyle = '#c98f00'; ctx.stroke();
+    text('+' + app.coinsEarned, W / 2 + 100, 347, 18, PAL.ink, 'center', '900');
+    if (app.comboBest > 0) {
+      text('Best chain x' + (app.comboBest + 1), W / 2, 371, 12, PAL.warn, 'center', '800');
+    }
+
+    ctx.restore();
+
+    button('next', 62, 382, 276, 66, 'NEXT LEVEL',
+      { action: doNext, color: PAL.good, edge: '#17914c', fg: '#fff', size: 20, radius: 18,
+        shadow: 'rgba(12,90,50,0.40)' });
+    button('winreplay', 62, 480, 132, MIN_BTN, 'REPLAY', { action: doRestart, size: 15 });
+    button('winmenu', 206, 480, 132, MIN_BTN, 'MENU', { action: doMenu, size: 15 });
+  }
+
+  function drawFail() {
+    drawPlay();
+    ctx.fillStyle = 'rgba(223,230,240,0.82)';
+    ctx.fillRect(0, 0, W, H);
+
+    drawPanel(40, 168, 320, 236);
+    text("TIME'S UP", W / 2, 216, 32, PAL.danger, 'center', '900');
+    text('You had ' + app.game.remainingCount() + ' creature' +
+      (app.game.remainingCount() === 1 ? '' : 's') + ' left', W / 2, 256, 14, PAL.inkSoft, 'center', '700');
+    text('Level ' + app.level, W / 2, 282, 13, PAL.inkSoft, 'center', '700');
+
+    button('plus30', 66, 306, 268, 62, '+30 SECONDS',
+      { action: doContinue, color: PAL.warn, edge: '#c96a10', fg: '#fff', size: 19, radius: 18,
+        shadow: 'rgba(150,80,10,0.4)' });
+    text(store.adsRemoved ? 'free' : 'watch a short ad', W / 2, 388, 11, PAL.inkSoft, 'center', '700');
+
+    button('retry', 62, 420, 132, MIN_BTN, 'RETRY', { action: doRestart, size: 15 });
+    button('failmenu', 206, 420, 132, MIN_BTN, 'MENU', { action: doMenu, size: 15 });
+  }
+
+  function drawLoading() {
+    drawBackground();
+    text('LEVEL ' + app.loadingLevel, W / 2, 268, 20, PAL.inkSoft, 'center', '800');
+    text('BUILDING PUZZLE', W / 2, 302, 26, PAL.ink, 'center', '900');
+    var t = Date.now() / 1000;
+    for (var i = 0; i < 3; i++) {
+      var col = CREATURE_COLORS[[0, 1, 3][i]];
+      var y = 348 + Math.sin(t * 2.4 + i * 0.9) * 8;
+      ctx.save();
+      ctx.strokeStyle = col.base;
+      ctx.lineWidth = 16; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      for (var k = 0; k <= 10; k++) {
+        var x = 120 + k * 16;
+        var yy = y + Math.sin(k * 0.7 + t * 3 + i) * 7;
+        if (k === 0) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+    text('measuring difficulty...', W / 2, 412, 12, PAL.inkSoft, 'center', '600');
+  }
+
+  function drawPause() {
+    drawPlay();
+    ctx.fillStyle = 'rgba(223,230,240,0.85)';
+    ctx.fillRect(0, 0, W, H);
+    drawPanel(46, 190, 308, 244);
+    text('PAUSED', W / 2, 240, 34, PAL.ink, 'center', '900');
+    text('Level ' + app.level, W / 2, 276, 14, PAL.inkSoft, 'center', '700');
+    button('resume', 74, 300, 252, 62, 'RESUME',
+      { action: doResume, color: PAL.accent, edge: PAL.accentDark, fg: '#fff', size: 20, radius: 18 });
+    button('pauseSound', 74, 370, 118, MIN_BTN, null,
+      { icon: store.sound ? 'sound' : 'mute', iconSize: 20, action: doToggleSound });
+    button('pausemenu', 208, 370, 118, MIN_BTN, 'MENU', { action: doMenu, size: 15 });
+  }
+
+  // =====================================================================
+  // Actions
+  // =====================================================================
+
+  function toast(msg) { app.toast = { text: msg, until: Date.now() + 1700 }; }
+
+  function doPlay() { requestLevel(store.current || 1); }
+  function doNext() { requestLevel(app.level + 1); }
+  function doRestart() {
+    if (!app.game) return;
+    app.game.restart();
+    app.timeLeft = app.timeLimit;
+    app.screen = SCREEN.PLAY;
+    app.stars = 0;
+    app.winDelay = 0.45;
+    app.combo = 0;
+    app.comboBest = 0;
+    app.lastExitAt = 0;
+    anims = {};
+    particles.length = 0;
+    drag = null;
+  }
+  function doMenu() {
+    app.screen = SCREEN.MENU;
+    drag = null;
+    if (!store.adsRemoved) bridgeShowBanner();
+  }
+  function doPause() { if (app.screen === SCREEN.PLAY) { app.screen = SCREEN.PAUSE; drag = null; } }
+  function doResume() { if (app.screen === SCREEN.PAUSE) app.screen = SCREEN.PLAY; }
+  function doUndo() {
+    if (!app.game || !app.game.canUndo()) return;
+    app.game.undo();
+    anims = {};
+    drag = null;
+  }
+  function doToggleSound() {
+    store.sound = !store.sound;
+    saveStore();
+    if (store.sound) { audioInit(); audioResume(); sfxTap(); }
+  }
+  function doRemoveAds() {
+    if (!bridgePurchaseRemoveAds()) toast('Store unavailable in browser');
+  }
+
+  function grantHint() {
+    var h = Core.findHint(app.game);
+    if (!h) { toast('No creature can exit - try UNDO'); return; }
+    app.hintCreature = h.id;
+    app.hintUntil = Date.now() + 3400;
+    var cr = app.game.creatures[h.id];
+    var p = cellCenter(cr.cells[0], app.game.cols);
+    floatText(p.x, p.y - layout.cell, 'THIS ONE', CREATURE_COLORS[cr.color % CREATURE_COLORS.length].line);
+    sfxStar(0);
+  }
+
+  function doHint() {
+    if (!app.game || app.screen !== SCREEN.PLAY) return;
+    if (store.freeHints > 0) {
+      store.freeHints--;
+      saveStore();
+      grantHint();
+      return;
+    }
+    app.pendingReward = 'hint';
+    if (!bridgeShowRewarded()) {
+      // standalone browser: no ad network, grant it so the game stays playable
+      window.setTimeout(function () { if (window.NeonUnravel) window.NeonUnravel.onReward(); }, 120);
+      toast('No ad available - hint granted');
+    }
+  }
+
+  function doContinue() {
+    app.pendingReward = 'continue';
+    if (store.adsRemoved) { window.NeonUnravel.onReward(); return; }
+    if (!bridgeShowRewarded()) {
+      window.setTimeout(function () { if (window.NeonUnravel) window.NeonUnravel.onReward(); }, 120);
+      toast('No ad available - time granted');
+    }
+  }
+
+  // =====================================================================
+  // Input - touch is handled by touch events, mouse by pointer events.
+  // No overlap, no double-handling.
+  // =====================================================================
+
+  function clientToCanvas(clientX, clientY) {
+    var rect = canvas.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left) * (W / rect.width),
+      y: (clientY - rect.top) * (H / rect.height)
+    };
+  }
+  function canvasToClient(x, y) {
+    var rect = canvas.getBoundingClientRect();
+    return { x: rect.left + x * (rect.width / W), y: rect.top + y * (rect.height / H) };
+  }
+
+  function hitButton(x, y) {
+    for (var i = uiButtons.length - 1; i >= 0; i--) {
+      var b = uiButtons[i];
+      if (!b.enabled) continue;
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) return b;
+    }
+    return null;
+  }
+
+  function findGrabbableHead(x, y) {
+    if (!app.game || app.screen !== SCREEN.PLAY) return -1;
+    var best = -1, bestD = Infinity;
+    var reach = layout.cell * 1.05;
+    for (var i = 0; i < app.game.creatures.length; i++) {
+      var cr = app.game.creatures[i];
+      if (cr.exited || cr.feeding >= 0 || !cr.cells.length) continue;
+      var p = cellCenter(cr.cells[0], app.game.cols);
+      var d = Math.hypot(p.x - x, p.y - y);
+      if (d < reach && d < bestD) { bestD = d; best = i; }
+    }
+    // an iced creature is not grabbable, but say so instead of ignoring the tap
+    if (best >= 0 && app.game.creatures[best].ice > 0) {
+      var frozen = app.game.creatures[best];
+      var fp = cellCenter(frozen.cells[0], app.game.cols);
+      floatText(fp.x, fp.y - layout.cell * 0.8, 'FROZEN: ' + frozen.ice + ' MORE', PAL.iceInk);
+      animFor(best).shake = 1;
+      animFor(best).shakeDir = Core.DIR_LEFT;
+      sfxFrozen();
+      return -1;
+    }
+    return best;
+  }
+
+  function onDown(x, y) {
+    audioInit(); audioResume();
+    var b = hitButton(x, y);
+    if (b) {
+      pressedId = b.id;
+      sfxTap();
+      render();                       // synchronous press feedback
+      return;
+    }
+    pressedId = null;
+    if (app.screen !== SCREEN.PLAY) return;
+    var id = findGrabbableHead(x, y);
+    if (id < 0) return;
+    app.game.beginGesture();
+    drag = { creatureId: id, x: x, y: y, steps: 0, lastStepAt: 0 };
+    animFor(id).glow = 1;
+    app.hintCreature = -1;
+    render();
+  }
+
+  function onMove(x, y) {
+    if (drag) { drag.x = x; drag.y = y; return; }
+    if (pressedId) {
+      var b = hitButton(x, y);
+      if (!b || b.id !== pressedId) { pressedId = null; }
+    }
+  }
+
+  function onUp(x, y) {
+    if (pressedId) {
+      var b = hitButton(x, y);
+      var was = pressedId;
+      pressedId = null;
+      if (b && b.id === was && b.action) { b.action(); }
+      render();
+      return;
+    }
+    if (drag) {
+      app.game.endGesture();
+      drag = null;
+    }
+  }
+
+  function onCancel() {
+    pressedId = null;
+    if (drag) { app.game.endGesture(); drag = null; }
+  }
+
+  var lastTouchPt = { x: 0, y: 0 };
+
+  /** Real devices sometimes deliver a touch event with no usable point
+      (cancelled gestures, palm rejection). Fall back to the last known one
+      rather than throwing inside an event handler. */
+  function pointFrom(e) {
+    var t = (e.changedTouches && e.changedTouches[0]) || (e.touches && e.touches[0]) || null;
+    if (!t) return lastTouchPt;
+    lastTouchPt = clientToCanvas(t.clientX, t.clientY);
+    return lastTouchPt;
+  }
+
+  function bindInput() {
+    canvas.addEventListener('touchstart', function (e) {
+      e.preventDefault();
+      var p = pointFrom(e);
+      onDown(p.x, p.y);
+    }, { passive: false });
+    canvas.addEventListener('touchmove', function (e) {
+      e.preventDefault();
+      var p = pointFrom(e);
+      onMove(p.x, p.y);
+    }, { passive: false });
+    canvas.addEventListener('touchend', function (e) {
+      e.preventDefault();
+      var p = pointFrom(e);
+      onUp(p.x, p.y);
+    }, { passive: false });
+    canvas.addEventListener('touchcancel', function (e) { e.preventDefault(); onCancel(); }, { passive: false });
+
+    // desktop mouse only - touch never reaches these
+    canvas.addEventListener('pointerdown', function (e) {
+      if (e.pointerType === 'touch') return;
+      e.preventDefault();
+      var p = clientToCanvas(e.clientX, e.clientY);
+      onDown(p.x, p.y);
+      try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+    });
+    canvas.addEventListener('pointermove', function (e) {
+      if (e.pointerType === 'touch') return;
+      var p = clientToCanvas(e.clientX, e.clientY);
+      onMove(p.x, p.y);
+    });
+    canvas.addEventListener('pointerup', function (e) {
+      if (e.pointerType === 'touch') return;
+      var p = clientToCanvas(e.clientX, e.clientY);
+      onUp(p.x, p.y);
+    });
+    canvas.addEventListener('pointercancel', function (e) {
+      if (e.pointerType === 'touch') return;
+      onCancel();
+    });
+    canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  }
+
+  // =====================================================================
+  // Drag -> movement.  The head steps one orthogonal cell at a time toward
+  // the finger, as fast as the step animation allows.
+  // =====================================================================
+
+  var lastBumpAt = 0;
+
+  function autoFeed(id) {
+    var g = app.game;
+    var cr = g.creatures[id];
+    if (!cr || cr.exited) return false;
+    var a = animFor(id);
+    if (a.t < 1) return true;
+    var d = Core.holeDirFromHead(g, id);
+    if (d < 0) return false;
+    var before = cr.cells.slice();
+    var holeIdx = -1;
+    var hc = g.colOf(before[0]) + Core.DIRS[d].dc, hr = g.rowOf(before[0]) + Core.DIRS[d].dr;
+    holeIdx = g.idx(hc, hr);
+    var res = g.stepHead(id, d);
+    if (!res.ok) return false;
+    beginStepAnim(id, before, null, true, holeIdx, 0.085);
+    sfxSlurp();
+    var p = cellCenter(holeIdx, g.cols);
+    burst(p.x, p.y, cr.color, 8);
+    if (res.exited) {
+      burst(p.x, p.y, cr.color, 30);
+      sfxExited(cr.color);
+      var now = Date.now() / 1000;
+      if (app.lastExitAt && now - app.lastExitAt <= COMBO_WINDOW) {
+        app.combo++;
+        if (app.combo > app.comboBest) app.comboBest = app.combo;
+        sfxCombo(app.combo);
+        floatText(p.x, p.y - layout.cell * 0.9, 'CHAIN x' + (app.combo + 1), PAL.warn);
+      } else {
+        app.combo = 0;
+        floatText(p.x, p.y - layout.cell * 0.9, 'OUT!', CREATURE_COLORS[cr.color % CREATURE_COLORS.length].line);
+      }
+      app.lastExitAt = now;
+
+      // ice countdowns tick on every exit; anything that hits zero shatters
+      if (res.shattered && res.shattered.length) {
+        sfxShatter();
+        res.shattered.forEach(function (sid) {
+          var frozen = g.creatures[sid];
+          if (!frozen || frozen.exited || !frozen.cells.length) return;
+          burstShatter(frozen);
+          animFor(sid).glow = 1;
+          var fp = cellCenter(frozen.cells[0], g.cols);
+          floatText(fp.x, fp.y - layout.cell * 0.8, 'FREE!', PAL.iceInk);
+        });
+      }
+      if (g.isWon() && drag) { g.endGesture(); drag = null; }
+    }
+    return true;
+  }
+
+  function updateDrag() {
+    var g = app.game;
+    if (!g) return;
+
+    // creatures that have begun feeding keep feeding, drag or no drag
+    for (var i = 0; i < g.creatures.length; i++) {
+      var c = g.creatures[i];
+      if (!c.exited && c.feeding >= 0) autoFeed(c.id);
+    }
+
+    if (!drag || app.screen !== SCREEN.PLAY) return;
+    var cr = g.creatures[drag.creatureId];
+    if (!cr || cr.exited) { g.endGesture(); drag = null; return; }
+    if (cr.feeding >= 0) return;
+
+    var a = animFor(cr.id);
+    if (a.t < 1) return;                       // one cell at a time, smoothly
+
+    var head = cr.cells[0];
+    var hx = cx(g.colOf(head)), hy = cy(g.rowOf(head));
+    var dx = (drag.x - hx) / layout.cell;
+    var dy = (drag.y - hy) / layout.cell;
+    var adx = Math.abs(dx), ady = Math.abs(dy);
+    if (Math.max(adx, ady) < 0.55) return;     // dead zone - no jitter
+
+    var order = [];
+    if (adx >= ady) {
+      order.push(dx > 0 ? Core.DIR_RIGHT : Core.DIR_LEFT);
+      if (ady > 0.35) order.push(dy > 0 ? Core.DIR_DOWN : Core.DIR_UP);
+    } else {
+      order.push(dy > 0 ? Core.DIR_DOWN : Core.DIR_UP);
+      if (adx > 0.35) order.push(dx > 0 ? Core.DIR_RIGHT : Core.DIR_LEFT);
+    }
+
+    for (var k = 0; k < order.length; k++) {
+      var dir = order[k];
+      var probe = g.canStep(cr.id, dir);
+      if (!probe.ok) continue;
+      if (probe.type === 'feed') { autoFeed(cr.id); return; }
+      var before = cr.cells.slice();
+      var res = g.stepHead(cr.id, dir);
+      if (!res.ok) continue;
+      var dist = Math.max(adx, ady);
+      beginStepAnim(cr.id, before, cr.cells, false, -1, Math.max(0.030, 0.075 - dist * 0.010));
+      drag.steps++;
+      sfxStep();
+      return;
+    }
+
+    // nothing legal in the direction the finger is pulling -> bump feedback
+    var now = Date.now();
+    if (now - lastBumpAt > 320) {
+      lastBumpAt = now;
+      a.shake = 1;
+      a.shakeDir = order[0];
+      app.boardShake = 4;
+      var why = g.canStep(cr.id, order[0]);
+      if (why.reason === 'gate') {
+        var hp = cellCenter(cr.cells[0], g.cols);
+        floatText(hp.x, hp.y - layout.cell * 0.8, 'WRONG COLOUR', PAL.danger);
+      }
+      sfxBlocked();
+    }
+  }
+
+  // =====================================================================
+  // Main loop
+  // =====================================================================
+
+  function tick(now) {
+    var dt = app.lastT ? Math.min(0.05, (now - app.lastT) / 1000) : 0.016;
+    app.lastT = now;
+
+    if (app.transition > 0) app.transition = Math.max(0, app.transition - dt * 3.2);
+    if (app.boardShake > 0) app.boardShake = Math.max(0, app.boardShake - dt * 26);
+
+    updateAnims(dt);
+    updateParticles(dt);
+
+    if (app.screen === SCREEN.PLAY && app.game) {
+      updateDrag();
+      if (app.game.isWon()) {
+        // let the last slurp finish, then celebrate. Driven from the loop (not
+        // a setTimeout) so pausing mid-slurp can never strand a won board.
+        app.winDelay -= dt;
+        if (app.winDelay <= 0) completeLevel();
+      } else {
+        app.elapsed += dt;
+        app.timeLeft -= dt;
+        if (app.timeLeft <= 0) { app.timeLeft = 0; failLevel(); }
+      }
+    }
+
+    render();
+    window.requestAnimationFrame(tick);
+  }
+
+  function render() {
+    uiButtons.length = 0;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    switch (app.screen) {
+      case SCREEN.MENU: drawMenu(); break;
+      case SCREEN.PLAY: drawPlay(); break;
+      case SCREEN.WIN: drawWin(); break;
+      case SCREEN.FAIL: drawFail(); break;
+      case SCREEN.PAUSE: drawPause(); break;
+      case SCREEN.LOADING: drawLoading(); break;
+      default: drawMenu();
+    }
+  }
+
+  // =====================================================================
+  // Boot
+  // =====================================================================
+
+  function resize() {
+    dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    var wrap = document.getElementById('nu-canvas-wrap');
+    var availW = window.innerWidth, availH = window.innerHeight;
+    if (wrap) {
+      // clientWidth/Height INCLUDE padding - subtract it so the canvas stays
+      // inside the safe-area inset box instead of spilling under a notch.
+      var cs = window.getComputedStyle(wrap);
+      availW = wrap.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+      availH = wrap.clientHeight - (parseFloat(cs.paddingTop) || 0) - (parseFloat(cs.paddingBottom) || 0);
+    }
+    availW = Math.max(80, availW);
+    availH = Math.max(80, availH);
+    var scale = Math.min(availW / W, availH / H);
+    canvas.style.width = Math.floor(W * scale) + 'px';
+    canvas.style.height = Math.floor(H * scale) + 'px';
+    canvas.width = Math.round(W * scale * dpr);
+    canvas.height = Math.round(H * scale * dpr);
+    dpr = canvas.width / W;         // effective logical -> device scale
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    render();
+  }
+
+  function boot() {
+    canvas = document.getElementById('nu-canvas');
+    ctx = canvas.getContext('2d', { alpha: false });
+    loadStore();
+    store.adsRemoved = store.adsRemoved || bridgeIsAdsRemoved();
+    bindInput();
+    resize();
+    window.addEventListener('resize', resize);
+    window.addEventListener('orientationchange', function () { window.setTimeout(resize, 120); });
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden && window.NeonUnravel) window.NeonUnravel.onPause();
+    });
+    if (!store.adsRemoved) bridgeShowBanner();
+    window.requestAnimationFrame(tick);
+  }
+
+  // ------------------------------------------------------- native hooks
+  window.NeonUnravel = {
+    onPause: function () {
+      if (app.screen === SCREEN.PLAY) { app.screen = SCREEN.PAUSE; drag = null; }
+      try { if (audio.ready) audio.ctx.suspend(); } catch (e) {}
+    },
+    onResume: function () {
+      audioResume();
+      // deliberately stays paused; the player taps RESUME
+    },
+    onReward: function () {
+      var what = app.pendingReward;
+      app.pendingReward = null;
+      if (what === 'hint') { grantHint(); }
+      else if (what === 'continue') {
+        app.timeLeft = Math.max(app.timeLeft, 0) + 30;
+        app.timeLimit = Math.max(app.timeLimit, app.timeLeft);
+        app.screen = SCREEN.PLAY;
+        toast('+30 seconds');
+        sfxStar(2);
+      }
+    },
+    onAdsRemovedChanged: function (removed) {
+      store.adsRemoved = !!removed;
+      saveStore();
+      if (store.adsRemoved) bridgeHideBanner(); else bridgeShowBanner();
+    }
+  };
+
+  // ------------------------------------------------- automated test hook
+  window.__NU = {
+    get game() { return app.game; },
+    get level() { return app.levelData; },
+    get screen() { return app.screen; },
+    get state() { return app; },
+    get core() { return Core; },
+    get store() { return store; },
+    get layout() { return layout; },
+    get buttons() { return uiButtons.map(function (b) { return { id: b.id, x: b.x, y: b.y, w: b.w, h: b.h, enabled: b.enabled }; }); },
+    get dragging() { return drag ? drag.creatureId : -1; },
+    get animating() {
+      for (var k in anims) if (anims[k].t < 1) return true;
+      return false;
+    },
+    /** logical canvas coords -> CSS/client px (for real touch dispatch) */
+    canvasToClient: canvasToClient,
+    clientToCanvas: clientToCanvas,
+    /** grid cell -> CSS/client px centre */
+    cellToClient: function (c, r) { return canvasToClient(cx(c), cy(r)); },
+    /** head of a creature -> CSS/client px centre */
+    headToClient: function (id) {
+      var cr = app.game.creatures[id];
+      if (!cr || !cr.cells.length) return null;
+      var p = cellCenter(cr.cells[0], app.game.cols);
+      return canvasToClient(p.x, p.y);
+    },
+    buttonToClient: function (id) {
+      for (var i = 0; i < uiButtons.length; i++) {
+        if (uiButtons[i].id === id) {
+          return canvasToClient(uiButtons[i].x + uiButtons[i].w / 2, uiButtons[i].y + uiButtons[i].h / 2);
+        }
+      }
+      return null;
+    },
+    buttonRectCss: function (id) {
+      for (var i = 0; i < uiButtons.length; i++) {
+        if (uiButtons[i].id === id) {
+          var rect = canvas.getBoundingClientRect();
+          var sx = rect.width / W, sy = rect.height / H;
+          return { w: uiButtons[i].w * sx, h: uiButtons[i].h * sy,
+                   x: rect.left + uiButtons[i].x * sx, y: rect.top + uiButtons[i].y * sy };
+        }
+      }
+      return null;
+    },
+    cellsOf: function (id) { return app.game.cellsOf(id); },
+    get difficulty() { return app.levelData ? app.levelData.difficulty : null; },
+    get combo() { return app.combo; },
+    get coins() { return store.coins; },
+    startLevel: startLevel,
+    requestLevel: requestLevel,
+    goMenu: doMenu,
+    setTimeLeft: function (t) { app.timeLeft = t; },
+    version: Core.VERSION
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
+})();
+
+</script>
+</body>
+</html>
